@@ -8,7 +8,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "eRepublik Tek Tarafı Boş Div4 & Air Avcısı Aktif!"
+    return "eRepublik Esnek Boş Cephe & RW Takipçisi Aktif!"
 
 def bot_loop():
     TOKEN = "8704453687:AAHrKY4bVuT0RaOtWoUcwlKxT_shuKqXO3Q"
@@ -33,7 +33,7 @@ def bot_loop():
     rw_alerts_sent = set()
 
     try:
-        requests.post(TG, json={"chat_id": CHAT_ID, "text": "🔥 *Tek Tarafı Boş Div4 & Air Avcısı Devrede!*", "parse_mode": "Markdown"})
+        requests.post(TG, json={"chat_id": CHAT_ID, "text": "🔥 *Esnek Boş Cephe & RW Takipçisi Devrede!*", "parse_mode": "Markdown"})
     except:
         pass
 
@@ -82,7 +82,7 @@ def bot_loop():
                             key = f"{b_id}_{sub_id}"
                             end_time = d_bilgi.get("end", 0)
                             
-                            # 1 saat 15 dk kuralı (4500 saniye geçmiş olmalı)
+                            # 1 saat 15 dk kuralı (Geçen süre >= 4500 saniye)
                             elapsed_round = 7200 - (end_time - current_time) if end_time else 0
                             
                             is_late = False
@@ -91,9 +91,8 @@ def bot_loop():
                                 
                             if is_late:
                                 stats_url = f"https://www.erepublik.com/tr/military/battlefield/{b_id}/{sub_id}/fighterStatistics"
-                                one_side_empty = False
-                                active_side_name = ""
-                                empty_side_name = ""
+                                is_open_target = False
+                                status_desc = ""
                                 
                                 try:
                                     stats_res = requests.get(stats_url, headers=HDR, timeout=5)
@@ -103,51 +102,42 @@ def bot_loop():
                                         inv_has_fighter = False
                                         def_has_fighter = False
                                         
-                                        # eRepublik istatistik yapısı genellikle inv ve def olarak veya liste içinde side bilgisiyle gelir
                                         if isinstance(stats_data, dict):
-                                            # Eğer dict içinde ayrı listeler varsa
                                             inv_list = stats_data.get("inv", stats_data.get("attacker", []))
                                             def_list = stats_data.get("def", stats_data.get("defender", []))
+                                            if inv_list and len(inv_list) > 0: inv_has_fighter = True
+                                            if def_list and len(def_list) > 0: def_has_fighter = True
                                             
-                                            if inv_list and len(inv_list) > 0:
-                                                inv_has_fighter = True
-                                            if def_list and len(def_list > 0):
-                                                def_has_fighter = True
-                                                
-                                            # Alternatif genel listeler kontrolü
                                             if not inv_has_fighter and not def_has_fighter:
                                                 for k, v in stats_data.items():
                                                     if isinstance(v, list) and len(v) > 0:
                                                         for f in v:
                                                             side = f.get("side") or f.get("country_id")
-                                                            if str(side) == inv_id:
-                                                                inv_has_fighter = True
-                                                            elif str(side) == def_id:
-                                                                def_has_fighter = True
+                                                            if str(side) == inv_id: inv_has_fighter = True
+                                                            elif str(side) == def_id: def_has_fighter = True
                                         elif isinstance(stats_data, list):
                                             for f in stats_data:
                                                 side = f.get("side") or f.get("country_id")
-                                                if str(side) == inv_id:
-                                                    inv_has_fighter = True
-                                                elif str(side) == def_id:
-                                                    def_has_fighter = True
+                                                if str(side) == inv_id: inv_has_fighter = True
+                                                elif str(side) == def_id: def_has_fighter = True
                                         
-                                        # KKRAL: Biri dolu (hasar var), diğeri tamamen boşsa yakala!
-                                        if inv_has_fighter and not def_has_fighter:
-                                            one_side_empty = True
-                                            active_side_name = inv_name
-                                            empty_side_name = def_name
+                                        # KKRAL KURAL: Tek taraf boş veya iki taraf birden boşsa (yani tam bir yığılma/direniş yoksa) hedef!
+                                        if not inv_has_fighter and not def_has_fighter:
+                                            is_open_target = True
+                                            status_desc = "İki taraf da tamamen boş (Kimse vurmamış)!"
+                                        elif inv_has_fighter and not def_has_fighter:
+                                            is_open_target = True
+                                            status_desc = f"`{def_name}` tarafı boş (Sadece {inv_name} vuruyor)!"
                                         elif def_has_fighter and not inv_has_fighter:
-                                            one_side_empty = True
-                                            active_side_name = def_name
-                                            empty_side_name = inv_name
+                                            is_open_target = True
+                                            status_desc = f"`{inv_name}` tarafı boş (Sadece {def_name} vuruyor)!"
                                 except Exception as ex:
                                     pass
                                     
-                                if one_side_empty:
+                                if is_open_target:
                                     if key not in SEEN_ALERTS:
                                         tur = "D4 KARA" if d_num == 4 else "AIR (SH)"
-                                        msg = f"💎 *TEK TARAFI BOŞ {tur} FIRSATI!*\n⚔️ {inv_name} vs {def_name}\n📍 Bölge: {bolge}\n🚀 `{active_side_name}` tarafı vuruyor, ancak `{empty_side_name}` tarafı tamamen boş!\n🔗 [Savaşa Git](https://www.erepublik.com/tr/military/battlefield/{b_id})"
+                                        msg = f"💎 *1H15M BOŞ {tur} FIRSATI!*\n⚔️ {inv_name} vs {def_name}\n📍 Bölge: {bolge}\n🚀 {status_desc}\n🔗 [Savaşa Git](https://www.erepublik.com/tr/military/battlefield/{b_id})"
                                         requests.post(TG, json={"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown"})
                                         SEEN_ALERTS.add(key)
                                 else:
@@ -156,13 +146,15 @@ def bot_loop():
                                         
                     time.sleep(0.3)
 
+                # RW 24 Saat Cooldown Takibi (5 dakika kala uyarı)
                 for b_id, track in list(ended_rw_tracker.items()):
                     elapsed = current_time - track["end_time"]
                     region = track["region"]
                     
+                    # 24 saat = 86400 saniye. 23 saat 55 dakika = 86100 saniye.
                     if 86100 <= elapsed < 86400:
                         if b_id not in rw_alerts_sent:
-                            rw_msg = f"⏳ *RW COOLDOWN UYARISI!*\n📍 Bölge: `{region}`\n⏰ Savaşın bitmesine 5 dakika kaldı (24 saatlik süre doluyor)!\n🚀 İsyan (RW) açmak için hazırlık yap!"
+                            rw_msg = f"⏳ *RW COOLDOWN UYARISI!*\n📍 Bölge: `{region}`\n⏰ Savaşın bit üzerinden 24 saat geçmesine 5 dakika kaldı!\n🚀 İsyan (RW) açmak için hazırlık yap!"
                             requests.post(TG, json={"chat_id": CHAT_ID, "text": rw_msg, "parse_mode": "Markdown"})
                             rw_alerts_sent.add(b_id)
                     elif elapsed >= 86400:
