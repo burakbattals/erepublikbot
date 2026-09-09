@@ -1,4 +1,3 @@
-
 import time
 import threading
 import requests
@@ -9,7 +8,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "eRepublik Detaylı Linkli Analiz Botu Aktif!"
+    return "eRepublik Optimizasyonlu Savaş Avcısı Aktif!"
 
 def bot_loop():
     TOKEN = "8704453687:AAHrKY4bVuT0RaOtWoUcwlKxT_shuKqXO3Q"
@@ -22,13 +21,14 @@ def bot_loop():
     HDR = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Cookie": USER_COOKIE,
-        "X-Requested-With": "XMLHttpRequest"
+        "X-Requested-With": "XMLHttpRequest",
+        "Referer": "https://www.erepublik.com/tr/main/index"
     }
 
-    sent_battles = set()
+    SEEN_ALERTS = set()
 
     try:
-        requests.post(TG, json={"chat_id": CHAT_ID, "text": "🔍 *Linkli Divizyon Analiz Modu Başlatıldı!*", "parse_mode": "Markdown"})
+        requests.post(TG, json={"chat_id": CHAT_ID, "text": "🛡️ *Optimizasyonlu Savaş Avcısı Devrede!*", "parse_mode": "Markdown"})
     except:
         pass
 
@@ -50,23 +50,32 @@ def bot_loop():
                     divler = kampanya.get("div", {})
                     for sub_id, d_bilgi in divler.items():
                         d_num = d_bilgi.get("div", 0)
+                        
                         if d_num in [4, 11]:
-                            key = f"{b_id}_{sub_id}"
-                            if key not in sent_battles:
+                            # Kampanya listesindeki co (contributors) verisini kontrol ediyoruz
+                            co = d_bilgi.get("co", {})
+                            inv_contributors = co.get("inv", [])
+                            def_contributors = co.get("def", [])
+                            
+                            # Eğer her iki tarafta da vuran kimse görünmüyorsa (veya liste boşsa)
+                            if not inv_contributors and not def_contributors:
                                 tur = "D4 KARA" if d_num == 4 else "AIR (SH)"
+                                key = f"{b_id}_{sub_id}"
                                 
-                                # Divizyon içindeki tüm anahtarları ve değerleri listele
-                                fields = "\n".join([f"• `{k}`: `{v}`" for k, v in d_bilgi.items()])
-                                
-                                msg = f"📊 *{tur} İnceleme* (ID: {b_id})\n⚔️ {inv_name} vs {def_name}\n📍 Bölge: {bolge}\n🔗 [Savaşa Git](https://www.erepublik.com/tr/military/battlefield/{b_id})\n\n*Alanlar:*\n{fields}"
-                                
-                                if len(msg) > 4000:
-                                    msg = msg[:4000]
+                                if key not in SEEN_ALERTS:
+                                    msg = f"💎 *TAZE VE BOŞ {tur} ALANI!*\n⚔️ {inv_name} vs {def_name}\n📍 Bölge: {bolge}\n🚀 Henüz vuran kimse yok, madalya fırsatı!\n🔗 [Savaşa Git](https://www.erepublik.com/tr/military/battlefield/{b_id})"
+                                    requests.post(TG, json={"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown"})
+                                    SEEN_ALERTS.add(key)
+                            else:
+                                # Daha önce boş rapor edilen ama sonradan vurulan cepheleri listeden temizle
+                                key = f"{b_id}_{sub_id}"
+                                if key in SEEN_ALERTS:
+                                    SEEN_ALERTS.remove(key)
                                     
-                                requests.post(TG, json={"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown"})
-                                sent_battles.add(key)
-                                
-            time.sleep(120)
+                    # Cloudflare'ı yormamak için her savaş taraması arasına minik nefesler koyuyoruz
+                    time.sleep(0.5)
+
+            time.sleep(60)
         except Exception as e:
             time.sleep(30)
 
