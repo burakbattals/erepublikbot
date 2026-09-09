@@ -8,7 +8,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "eRepublik Net 1H15M Geçen Süre & Boş Cephe Botu Aktif!"
+    return "eRepublik Yukarı Sayan Süre Botu Aktif!"
 
 def bot_loop():
     TOKEN = "8704453687:AAHrKY4bVuT0RaOtWoUcwlKxT_shuKqXO3Q"
@@ -33,7 +33,7 @@ def bot_loop():
     rw_alerts_sent = set()
 
     try:
-        requests.post(TG, json={"chat_id": CHAT_ID, "text": "🔥 *eRepublik Süre Uyumlu Boş Cephe & RW Botu Başlatıldı!*", "parse_mode": "Markdown"})
+        requests.post(TG, json={"chat_id": CHAT_ID, "text": "🔥 *Yukarı Sayan Süre Botu Devrede!*", "parse_mode": "Markdown"})
     except:
         pass
 
@@ -77,23 +77,25 @@ def bot_loop():
                     for sub_id, d_bilgi in divler.items():
                         d_num = d_bilgi.get("div", 0)
                         
-                        # Sadece Div 4 (4) ve Air (11)
                         if d_num in [4, 11]:
                             key = f"{b_id}_{sub_id}"
                             end_time = d_bilgi.get("end", 0)
                             
                             if end_time:
-                                # Round başlama zamanı: Bitiş zamanından 2 saat (7200 sn) öncesidir.
                                 start_time = end_time - 7200
-                                # Round başladığından beri geçen süre (0'dan ileriye doğru akan süre)
                                 elapsed_seconds = current_time - start_time
                             else:
                                 elapsed_seconds = 0
                             
-                            # 1 saat 15 dakika = 4500 saniye
+                            elapsed_min = elapsed_seconds / 60
+                            
+                            # 1 saat 15 dakika = 4500 saniye (Geçen süre 4500 sn ve üzeriyse tetiklenir)
                             is_late = False
-                            if elapsed_seconds >= 4500 and (end_time - current_time) > 0:
+                            if elapsed_seconds >= 4500:
                                 is_late = True
+                                
+                            tur_adi = "D4" if d_num == 4 else "AIR"
+                            print(f"[{tur_adi}] Bölge: {bolge} | Geçen Süre: {elapsed_min:.1f} dk | 1h15m Geçti mi?: {is_late}")
                                 
                             if is_late:
                                 stats_url = f"https://www.erepublik.com/tr/military/battlefield/{b_id}/{sub_id}/fighterStatistics"
@@ -151,7 +153,6 @@ def bot_loop():
                                         
                     time.sleep(0.3)
 
-                # RW 24 Saat Cooldown Takibi (5 dakika kala uyarı)
                 for b_id, track in list(ended_rw_tracker.items()):
                     elapsed = current_time - track["end_time"]
                     region = track["region"]
