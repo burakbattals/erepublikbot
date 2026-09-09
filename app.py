@@ -8,7 +8,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "eRepublik Süper Bot Aktif ve Nöbette!"
+    return "eRepublik Madalya Avcısı Aktif ve Nöbette!"
 
 def bot_loop():
     TOKEN = "8704453687:AAHrKY4bVuT0RaOtWoUcwlKxT_shuKqXO3Q"
@@ -24,85 +24,52 @@ def bot_loop():
         "X-Requested-With": "XMLHttpRequest"
     }
 
-    SEEN_BATTLE = set()
-    rw_takip_listesi = {}
+    SEEN_SNIPER = set()
 
     try:
-        requests.post(TG, json={"chat_id": CHAT_ID, "text": "🤖 *eRepublik Süper Bot Hata Raporlama Moduyla Aktif!*", "parse_mode": "Markdown"})
+        requests.post(TG, json={"chat_id": CHAT_ID, "text": "🎯 *Madalya Avcısı (Son 15 dk + 0 Hasar) Devrede!*", "parse_mode": "Markdown"})
     except:
         pass
 
     while True:
         try:
             r = requests.get(URL, headers=HDR, timeout=10)
-            
-            # Eğer istek başarılı (200) dönmezse veya Cloudflare engeline takılırsak bildir
-            if r.status_code != 200:
-                requests.post(TG, json={"chat_id": CHAT_ID, "text": f"⚠️ *eRepublik Engel/Hata!* Status: {r.status_code}\nCevap özeti: {r.text[:150]}", "parse_mode": "Markdown"})
-                time.sleep(120)
-                continue
-
-            try:
+            if r.status_code == 200:
                 data = r.json()
-            except Exception as json_err:
-                requests.post(TG, json={"chat_id": CHAT_ID, "text": f"⚠️ *JSON Çözümleme Hatası (Cloudflare Engeli Olabilir)*:\n`{str(json_err)}`", "parse_mode": "Markdown"})
-                time.sleep(120)
-                continue
-
-            battles_dict = data.get("battles", {})
-            countries_dict = data.get("countries", {})
-            Suan = int(time.time())
-            
-            # 1. D4 ve Air (Son 15 dk)
-            for b_id, kampanya in battles_dict.items():
-                bolge = kampanya.get("region", {}).get("name", "Bölge")
-                inv_id = str(kampanya.get("inv", {}).get("id"))
-                def_id = str(kampanya.get("def", {}).get("id"))
-                inv_name = countries_dict.get(inv_id, {}).get("name", "Saldırgan")
-                def_name = countries_dict.get(def_id, {}).get("name", "Savunan")
+                battles_dict = data.get("battles", {})
+                countries_dict = data.get("countries", {})
+                Suan = int(time.time())
                 
-                divler = kampanya.get("div", {})
-                for sub_id, d_bilgi in divler.items():
-                    d_num = d_bilgi.get("div", 0)
-                    end = d_bilgi.get("end")
-                    if d_num in [4, 11] and end is not None:
-                        kalan = end - Suan
-                        if 0 < kalan <= 900:
-                            tur = "D4 KARA" if d_num == 4 else "AIR (SH)"
-                            key = f"{b_id}_{sub_id}"
-                            if key not in SEEN_BATTLE:
-                                msg = f"🚨 *{tur} BİTİYOR (Son {kalan//60} dk)!*\n⚔️ {inv_name} vs {def_name}\n📍 Bölge: {bolge}\n🔗 [Savaşa Git](https://www.erepublik.com/tr/military/battlefield/{b_id})"
-                                requests.post(TG, json={"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown"})
-                                SEEN_BATTLE.add(key)
+                for b_id, kampanya in battles_dict.items():
+                    bolge = kampanya.get("region", {}).get("name", "Bölge")
+                    inv_id = str(kampanya.get("inv", {}).get("id"))
+                    def_id = str(kampanya.get("def", {}).get("id"))
+                    inv_name = countries_dict.get(inv_id, {}).get("name", "Saldırgan")
+                    def_name = countries_dict.get(def_id, {}).get("name", "Savunan")
+                    
+                    divler = kampanya.get("div", {})
+                    for sub_id, d_bilgi in divler.items():
+                        d_num = d_bilgi.get("div", 0)
+                        end = d_bilgi.get("end")
+                        
+                        # Skor / Hasar kontrolü (Divizyon içi vuruşlar)
+                        score_inv = d_bilgi.get("inv_score", 0)
+                        score_def = d_bilgi.get("def_score", 0)
+                        
+                        if d_num in [4, 11] and end is not None:
+                            kalan = end - Suan
+                            
+                            # KOŞUL: Son 15 dakika kala VE divizyon skoru/hasarı 0 iken
+                            if 0 < kalan <= 900 and score_inv == 0 and score_def == 0:
+                                tur = "D4 KARA" if d_num == 4 else "AIR (SH)"
+                                key = f"{b_id}_{sub_id}"
+                                if key not in SEEN_SNIPER:
+                                    msg = f"🚨 *{tur} SNIPER ALARMI (Son {kalan//60} dk)!*\n⚔️ {inv_name} vs {def_name}\n📍 Bölge: {bolge}\n💎 Divizyon temiz (0 Hasar), madalya için bas!\n🔗 [Savaşa Git](https://www.erepublik.com/tr/military/battlefield/{b_id})"
+                                    requests.post(TG, json={"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown"})
+                                    SEEN_SNIPER.add(key)
 
-            # 2. RW Havuzu Kayıt
-            for b_id, kampanya in battles_dict.items():
-                bolge_id = kampanya.get("region", {}).get("id")
-                bolge_adi = kampanya.get("region", {}).get("name", "Bölge")
-                divler = kampanya.get("div", {})
-                for sub_id, d_bilgi in divler.items():
-                    if d_bilgi.get("div", 0) in [4, 11] and d_bilgi.get("end") is not None:
-                        hedef_rw_zaman = d_bilgi.get("end") + 86400
-                        if bolge_id not in rw_takip_listesi:
-                            rw_takip_listesi[bolge_id] = {
-                                "region": bolge_adi,
-                                "rw_time": hedef_rw_zaman,
-                                "notified": False
-                            }
-
-            # 3. RW Alarm (5 dk kala)
-            for b_id, bilgi in list(rw_takip_listesi.items()):
-                kalan_sure = bilgi["rw_time"] - Suan
-                if 0 < kalan_sure <= 300 and not bilgi["notified"]:
-                    msg = f"🚨 *RW ALARMI (5 dk kaldı)!*\n📍 Bölge: {bilgi['region']}\n⏳ Direniş birazdan açılıyor, hazırlık yap!"
-                    requests.post(TG, json={"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown"})
-                    bilgi["notified"] = True
-                elif kalan_sure <= 0:
-                    del rw_takip_listesi[b_id]
-
-            time.sleep(120)
+            time.sleep(60)
         except Exception as e:
-            requests.post(TG, json={"chat_id": CHAT_ID, "text": f"⚠️ *Kritik Döngü Hatası*:\n`{str(e)}`", "parse_mode": "Markdown"})
             time.sleep(30)
 
 if __name__ == "__main__":
