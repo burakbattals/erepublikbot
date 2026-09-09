@@ -8,7 +8,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "eRepublik Nokta Atışı Div4 & Air Avcısı Aktif!"
+    return "eRepublik Tek Tarafı Boş Div4 & Air Avcısı Aktif!"
 
 def bot_loop():
     TOKEN = "8704453687:AAHrKY4bVuT0RaOtWoUcwlKxT_shuKqXO3Q"
@@ -20,6 +20,8 @@ def bot_loop():
 
     HDR = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7",
         "Cookie": USER_COOKIE,
         "X-Requested-With": "XMLHttpRequest",
         "Referer": "https://www.erepublik.com/tr/main/index"
@@ -31,7 +33,7 @@ def bot_loop():
     rw_alerts_sent = set()
 
     try:
-        requests.post(TG, json={"chat_id": CHAT_ID, "text": "🔥 *Div4 & Air Boş Cephe Avcısı Aktif!*", "parse_mode": "Markdown"})
+        requests.post(TG, json={"chat_id": CHAT_ID, "text": "🔥 *Tek Tarafı Boş Div4 & Air Avcısı Devrede!*", "parse_mode": "Markdown"})
     except:
         pass
 
@@ -39,7 +41,12 @@ def bot_loop():
         try:
             r = requests.get(URL, headers=HDR, timeout=10)
             if r.status_code == 200:
-                data = r.json()
+                try:
+                    data = r.json()
+                except:
+                    time.sleep(60)
+                    continue
+
                 battles_dict = data.get("battles", {})
                 countries_dict = data.get("countries", {})
                 current_time = time.time()
@@ -75,7 +82,7 @@ def bot_loop():
                             key = f"{b_id}_{sub_id}"
                             end_time = d_bilgi.get("end", 0)
                             
-                            # 1 saat 15 dk sonrası kuralı (Geçen süre >= 4500 saniye)
+                            # 1 saat 15 dk kuralı (4500 saniye geçmiş olmalı)
                             elapsed_round = 7200 - (end_time - current_time) if end_time else 0
                             
                             is_late = False
@@ -83,23 +90,64 @@ def bot_loop():
                                 is_late = True
                                 
                             if is_late:
-                                # DOĞRU URL FORMATI: /{b_id}/{sub_id}/fighterStatistics
                                 stats_url = f"https://www.erepublik.com/tr/military/battlefield/{b_id}/{sub_id}/fighterStatistics"
-                                is_empty = False
+                                one_side_empty = False
+                                active_side_name = ""
+                                empty_side_name = ""
+                                
                                 try:
                                     stats_res = requests.get(stats_url, headers=HDR, timeout=5)
                                     if stats_res.status_code == 200:
                                         stats_data = stats_res.json()
-                                        fighters = stats_data if isinstance(stats_data, list) else stats_data.get("fighters", [])
-                                        if not fighters:
-                                            is_empty = True
-                                except:
-                                    is_empty = False
+                                        
+                                        inv_has_fighter = False
+                                        def_has_fighter = False
+                                        
+                                        # eRepublik istatistik yapısı genellikle inv ve def olarak veya liste içinde side bilgisiyle gelir
+                                        if isinstance(stats_data, dict):
+                                            # Eğer dict içinde ayrı listeler varsa
+                                            inv_list = stats_data.get("inv", stats_data.get("attacker", []))
+                                            def_list = stats_data.get("def", stats_data.get("defender", []))
+                                            
+                                            if inv_list and len(inv_list) > 0:
+                                                inv_has_fighter = True
+                                            if def_list and len(def_list > 0):
+                                                def_has_fighter = True
+                                                
+                                            # Alternatif genel listeler kontrolü
+                                            if not inv_has_fighter and not def_has_fighter:
+                                                for k, v in stats_data.items():
+                                                    if isinstance(v, list) and len(v) > 0:
+                                                        for f in v:
+                                                            side = f.get("side") or f.get("country_id")
+                                                            if str(side) == inv_id:
+                                                                inv_has_fighter = True
+                                                            elif str(side) == def_id:
+                                                                def_has_fighter = True
+                                        elif isinstance(stats_data, list):
+                                            for f in stats_data:
+                                                side = f.get("side") or f.get("country_id")
+                                                if str(side) == inv_id:
+                                                    inv_has_fighter = True
+                                                elif str(side) == def_id:
+                                                    def_has_fighter = True
+                                        
+                                        # KKRAL: Biri dolu (hasar var), diğeri tamamen boşsa yakala!
+                                        if inv_has_fighter and not def_has_fighter:
+                                            one_side_empty = True
+                                            active_side_name = inv_name
+                                            empty_side_name = def_name
+                                        elif def_has_fighter and not inv_has_fighter:
+                                            one_side_empty = True
+                                            active_side_name = def_name
+                                            empty_side_name = inv_name
+                                except Exception as ex:
+                                    pass
                                     
-                                if is_empty:
+                                if one_side_empty:
                                     if key not in SEEN_ALERTS:
                                         tur = "D4 KARA" if d_num == 4 else "AIR (SH)"
-                                        msg = f"💎 *TERTEMİZ BOŞ {tur} FIRSATI!*\n⚔️ {inv_name} vs {def_name}\n📍 Bölge: {bolge}\n⏰ 1 saat 15 dk kuralı tamam, tabloda hiç hasar/isim yok (Tamamen boş)!\n🔗 [Savaşa Git](https://www.erepublik.com/tr/military/battlefield/{b_id})"
+                                        msg = f"💎 *TEK TARAFI BOŞ {tur} FIRSATI!*\n⚔️ {inv_name} vs {def_name}\n📍 Bölge: {bolge}\n🚀 `{active_side_name}` tarafı vuruyor, ancak `{empty_side_name}` tarafı tamamen boş!\n🔗 [Savaşa Git](https://www.erepublik.com/tr/military/battlefield/{b_id})"
                                         requests.post(TG, json={"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown"})
                                         SEEN_ALERTS.add(key)
                                 else:
