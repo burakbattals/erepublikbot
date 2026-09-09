@@ -8,7 +8,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "eRepublik Gerçek Boş Cephe Div4 & Air Avcısı Aktif!"
+    return "eRepublik Nokta Atışı Div4 & Air Avcısı Aktif!"
 
 def bot_loop():
     TOKEN = "8704453687:AAHrKY4bVuT0RaOtWoUcwlKxT_shuKqXO3Q"
@@ -31,7 +31,7 @@ def bot_loop():
     rw_alerts_sent = set()
 
     try:
-        requests.post(TG, json={"chat_id": CHAT_ID, "text": "🔥 *Gerçek Boş Cephe Div4 & Air Avcısı Devrede!*", "parse_mode": "Markdown"})
+        requests.post(TG, json={"chat_id": CHAT_ID, "text": "🔥 *Div4 & Air Boş Cephe Avcısı Aktif!*", "parse_mode": "Markdown"})
     except:
         pass
 
@@ -75,18 +75,16 @@ def bot_loop():
                             key = f"{b_id}_{sub_id}"
                             end_time = d_bilgi.get("end", 0)
                             
-                            # 1 saat 15 dk sonrası kuralı: Round süresi 2 saattir (7200 sn). 
-                            # Geçen süre = 7200 - (end_time - current_time)
+                            # 1 saat 15 dk sonrası kuralı (Geçen süre >= 4500 saniye)
                             elapsed_round = 7200 - (end_time - current_time) if end_time else 0
                             
-                            # 1 saat 15 dk = 4500 saniye
                             is_late = False
                             if end_time and elapsed_round >= 4500 and (end_time - current_time) > 0:
                                 is_late = True
                                 
                             if is_late:
-                                # Savaş istatistikleri endpoint'ini sorgulayarak tabloda isim/hasar var mı kontrol ediyoruz
-                                stats_url = f"https://www.erepublik.com/tr/military/battlefield/fighterStatistics/{b_id}/{sub_id}"
+                                # DOĞRU URL FORMATI: /{b_id}/{sub_id}/fighterStatistics
+                                stats_url = f"https://www.erepublik.com/tr/military/battlefield/{b_id}/{sub_id}/fighterStatistics"
                                 is_empty = False
                                 try:
                                     stats_res = requests.get(stats_url, headers=HDR, timeout=5)
