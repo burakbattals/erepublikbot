@@ -8,7 +8,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "eRepublik Akıllı Hasar & RW Takipçisi Aktif!"
+    return "eRepublik Kesin Skorlu Div4 & Air Avcısı Aktif!"
 
 def bot_loop():
     TOKEN = "8704453687:AAHrKY4bVuT0RaOtWoUcwlKxT_shuKqXO3Q"
@@ -27,11 +27,11 @@ def bot_loop():
 
     SEEN_ALERTS = set()
     previous_battles = {}
-    ended_rw_tracker = {} # Bölge bazlı kapanan savaşların bitiş zamanını tutar (RW 24 saat sayacı için)
+    ended_rw_tracker = {}
     rw_alerts_sent = set()
 
     try:
-        requests.post(TG, json={"chat_id": CHAT_ID, "text": "🔥 *Hasar & RW 24 Saat Takipçisi Devrede!*", "parse_mode": "Markdown"})
+        requests.post(TG, json={"chat_id": CHAT_ID, "text": "🔥 *Kesin Skorlu Div4 & Air Avcısı Devrede!*", "parse_mode": "Markdown"})
     except:
         pass
 
@@ -44,13 +44,11 @@ def bot_loop():
                 countries_dict = data.get("countries", {})
                 current_time = time.time()
                 
-                # 1. Biten savaşları tespit et (RW cooldown takibi için)
                 current_battle_ids = set(battles_dict.keys())
                 if previous_battles:
                     ended_ids = set(previous_battles.keys()) - current_battle_ids
                     for e_id in ended_ids:
                         b_info = previous_battles[e_id]
-                        # Eğer bu bir direnniş savaşı (RW) ise veya genel savaşsa bitiş zamanını kaydet
                         region_name = b_info.get("region_name", "Bölge")
                         ended_rw_tracker[e_id] = {
                             "end_time": current_time,
@@ -72,11 +70,34 @@ def bot_loop():
                     for sub_id, d_bilgi in divler.items():
                         d_num = d_bilgi.get("div", 0)
                         
+                        # Sadece Div 4 (4) ve Air (11) alınıyor
                         if d_num in [4, 11]:
                             key = f"{b_id}_{sub_id}"
                             
-                            inv_score = d_bilgi.get("inv_score", 0) or d_bilgi.get("inv_points", 0) or kampanya.get("inv", {}).get("points", 0)
-                            def_score = d_bilgi.get("def_score", 0) or d_bilgi.get("def_points", 0) or kampanya.get("def", {}).get("points", 0)
+                            # Skorları tüm olası yollardan güvenli şekilde çekelim
+                            inv_score = (
+                                d_bilgi.get("inv_score", 0) or 
+                                d_bilgi.get("inv_points", 0) or 
+                                d_bilgi.get("inv", {}).get("points", 0) or
+                                kampanya.get("inv", {}).get("points", 0)
+                            )
+                            def_score = (
+                                d_bilgi.get("def_score", 0) or 
+                                d_bilgi.get("def_points", 0) or 
+                                d_bilgi.get("def", {}).get("points", 0) or
+                                kampanya.get("def", {}).get("points", 0)
+                            )
+                            
+                            # Sayısal değere dönüştürme garantisi
+                            try:
+                                inv_score = int(inv_score)
+                            except:
+                                inv_score = 0
+                            try:
+                                def_score = int(def_score)
+                            goose = 0
+                        except:
+                            def_score = 0
                             
                             co = d_bilgi.get("co", {})
                             inv_c = co.get("inv", [])
@@ -89,7 +110,7 @@ def bot_loop():
                             elif inv_score >= 1350 or def_score >= 1350:
                                 is_late = True
                                 
-                            # Kriter: Son düzlükte olunduğunda TARAFLARDAN HERHANGİ BİRİNİN listesinin boş olması (Biri vurmamışsa yeter!)
+                            # Taraflardan herhangi birinin listesi boşsa ve son düzlükteyesek yakala
                             if is_late and (not inv_c or not def_c):
                                 if key not in SEEN_ALERTS:
                                     tur = "D4 KARA" if d_num == 4 else "AIR (SH)"
@@ -103,20 +124,16 @@ def bot_loop():
                                     
                     time.sleep(0.5)
 
-                # 2. RW 24 Saat Cooldown Kontrolü (24 saatin dolmasına 5 dk kala haber ver)
-                # 24 saat = 86400 saniye. 5 dakika kala = 86400 - 300 = 86100 saniye geçmesi demek.
                 for b_id, track in list(ended_rw_tracker.items()):
                     elapsed = current_time - track["end_time"]
                     region = track["region"]
                     
-                    # 23 saat 55 dakika ile 24 saat arasında ise ve daha önce bildirim atılmadıysa
                     if 86100 <= elapsed < 86400:
                         if b_id not in rw_alerts_sent:
                             rw_msg = f"⏳ *RW COOLDOWN UYARISI!*\n📍 Bölge: `{region}`\n⏰ Savaşın bitmesine 5 dakika kaldı (24 saatlik süre doluyor)!\n🚀 İsyan (RW) açmak için hazırlık yap!"
                             requests.post(TG, json={"chat_id": CHAT_ID, "text": rw_msg, "parse_mode": "Markdown"})
                             rw_alerts_sent.add(b_id)
                     elif elapsed >= 86400:
-                        # Süre tamamen dolduysa listeden temizle
                         del ended_rw_tracker[b_id]
 
             time.sleep(60)
