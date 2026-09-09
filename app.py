@@ -8,7 +8,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "eRepublik Kesin Skorlu Div4 & Air Avcısı Aktif!"
+    return "eRepublik Gerçek Boş Cephe Div4 & Air Avcısı Aktif!"
 
 def bot_loop():
     TOKEN = "8704453687:AAHrKY4bVuT0RaOtWoUcwlKxT_shuKqXO3Q"
@@ -31,7 +31,7 @@ def bot_loop():
     rw_alerts_sent = set()
 
     try:
-        requests.post(TG, json={"chat_id": CHAT_ID, "text": "🔥 *Kesin Skorlu Div4 & Air Avcısı Devrede!*", "parse_mode": "Markdown"})
+        requests.post(TG, json={"chat_id": CHAT_ID, "text": "🔥 *Gerçek Boş Cephe Div4 & Air Avcısı Devrede!*", "parse_mode": "Markdown"})
     except:
         pass
 
@@ -70,55 +70,45 @@ def bot_loop():
                     for sub_id, d_bilgi in divler.items():
                         d_num = d_bilgi.get("div", 0)
                         
+                        # Sadece Div 4 (4) ve Air (11)
                         if d_num in [4, 11]:
                             key = f"{b_id}_{sub_id}"
+                            end_time = d_bilgi.get("end", 0)
                             
-                            inv_score = (
-                                d_bilgi.get("inv_score", 0) or 
-                                d_bilgi.get("inv_points", 0) or 
-                                d_bilgi.get("inv", {}).get("points", 0) or
-                                kampanya.get("inv", {}).get("points", 0)
-                            )
-                            def_score = (
-                                d_bilgi.get("def_score", 0) or 
-                                d_bilgi.get("def_points", 0) or 
-                                d_bilgi.get("def", {}).get("points", 0) or
-                                kampanya.get("def", {}).get("points", 0)
-                            )
+                            # 1 saat 15 dk sonrası kuralı: Round süresi 2 saattir (7200 sn). 
+                            # Geçen süre = 7200 - (end_time - current_time)
+                            elapsed_round = 7200 - (end_time - current_time) if end_time else 0
                             
-                            try:
-                                inv_score = int(inv_score)
-                            except:
-                                inv_score = 0
-                                
-                            try:
-                                def_score = int(def_score)
-                            except:
-                                def_score = 0
-                            
-                            co = d_bilgi.get("co", {})
-                            inv_c = co.get("inv", [])
-                            def_c = co.get("def", [])
-                            
-                            end_time = d_bilgi.get("end")
+                            # 1 saat 15 dk = 4500 saniye
                             is_late = False
-                            if end_time and 0 < (end_time - current_time) <= 900:
-                                is_late = True
-                            elif inv_score >= 1350 or def_score >= 1350:
+                            if end_time and elapsed_round >= 4500 and (end_time - current_time) > 0:
                                 is_late = True
                                 
-                            if is_late and (not inv_c or not def_c):
-                                if key not in SEEN_ALERTS:
-                                    tur = "D4 KARA" if d_num == 4 else "AIR (SH)"
-                                    empty_side = inv_name if not inv_c else def_name
-                                    msg = f"💎 *TEK TARAFI BOŞ {tur} FIRSATI!*\n⚔️ {inv_name} vs {def_name}\n📍 Bölge: {bolge}\n📊 Skor: {inv_score} - {def_score}\n🚀 `{empty_side}` tarafında vuran kimse yok!\n🔗 [Savaşa Git](https://www.erepublik.com/tr/military/battlefield/{b_id})"
-                                    requests.post(TG, json={"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown"})
-                                    SEEN_ALERTS.add(key)
-                            else:
-                                if key in SEEN_ALERTS and inv_c and def_c:
-                                    SEEN_ALERTS.remove(key)
+                            if is_late:
+                                # Savaş istatistikleri endpoint'ini sorgulayarak tabloda isim/hasar var mı kontrol ediyoruz
+                                stats_url = f"https://www.erepublik.com/tr/military/battlefield/fighterStatistics/{b_id}/{sub_id}"
+                                is_empty = False
+                                try:
+                                    stats_res = requests.get(stats_url, headers=HDR, timeout=5)
+                                    if stats_res.status_code == 200:
+                                        stats_data = stats_res.json()
+                                        fighters = stats_data if isinstance(stats_data, list) else stats_data.get("fighters", [])
+                                        if not fighters:
+                                            is_empty = True
+                                except:
+                                    is_empty = False
                                     
-                    time.sleep(0.5)
+                                if is_empty:
+                                    if key not in SEEN_ALERTS:
+                                        tur = "D4 KARA" if d_num == 4 else "AIR (SH)"
+                                        msg = f"💎 *TERTEMİZ BOŞ {tur} FIRSATI!*\n⚔️ {inv_name} vs {def_name}\n📍 Bölge: {bolge}\n⏰ 1 saat 15 dk kuralı tamam, tabloda hiç hasar/isim yok (Tamamen boş)!\n🔗 [Savaşa Git](https://www.erepublik.com/tr/military/battlefield/{b_id})"
+                                        requests.post(TG, json={"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown"})
+                                        SEEN_ALERTS.add(key)
+                                else:
+                                    if key in SEEN_ALERTS:
+                                        SEEN_ALERTS.remove(key)
+                                        
+                    time.sleep(0.3)
 
                 for b_id, track in list(ended_rw_tracker.items()):
                     elapsed = current_time - track["end_time"]
