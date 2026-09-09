@@ -2,7 +2,7 @@ import time
 import threading
 import requests
 import os
-from Flask import Flask
+from flask import Flask
 
 app = Flask(__name__)
 
@@ -54,24 +54,18 @@ def bot_loop():
                         if d_num in [4, 11]:
                             key = f"{b_id}_{sub_id}"
                             
-                            # Skor kontrolü (eRepublik'te inv_points ve def_points veya benzeri skor alanları olur)
-                            # Puanlardan herhangi biri 1350'yi geçtiyse son düzlüğe (son 15 dakikaya) girilmiştir
                             inv_score = d_bilgi.get("inv_score", 0) or d_bilgi.get("inv_points", 0)
                             def_score = d_bilgi.get("def_score", 0) or d_bilgi.get("def_points", 0)
                             
-                            # Alternatif olarak genel kampanya objesindeki skorlara da bakabiliriz
-                            # Eğer skor verisi doğrudan d_bilgi içinde yoksa, puanları kampanya genelinden alalım:
                             if not inv_score:
                                 inv_score = kampanya.get("inv", {}).get("points", 0)
                             if not def_score:
                                 def_score = kampanya.get("def", {}).get("points", 0)
                                 
-                            # Katkıda bulunanlar (vuranlar) listesi
                             co = d_bilgi.get("co", {})
                             inv_c = co.get("inv", [])
                             def_c = co.get("def", [])
                             
-                            # Kriter: Skor 1350'yi geçtiyse VEYA API end süresi son 15 dakikadaysa
                             end_time = d_bilgi.get("end")
                             current_time = time.time()
                             
@@ -81,11 +75,9 @@ def bot_loop():
                             elif inv_score >= 1350 or def_score >= 1350:
                                 is_late = True
                                 
-                            # Eğer son düzlükteyesek VE o roundda vuran kimse yoksa (listeler boşsa)
                             if is_late and not inv_c and not def_c:
                                 if key not in SEEN_ALERTS:
                                     tur = "D4 KARA" if d_num == 4 else "AIR (SH)"
-                                    max_score = max(inv_score, def_score)
                                     msg = f"💎 *KRİTİK FIRSAT: BOŞ {tur}!*\n⚔️ {inv_name} vs {def_name}\n📍 Bölge: {bolge}\n📊 Skor: {inv_score} - {def_score} (Son Düzlük!)\n🚀 Kimse vurmamış, madalya tarlası!\n🔗 [Savaşa Git](https://www.erepublik.com/tr/military/battlefield/{b_id})"
                                     requests.post(TG, json={"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown"})
                                     SEEN_ALERTS.add(key)
