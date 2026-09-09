@@ -8,7 +8,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "eRepublik Akıllı Kademeli Avcı Aktif!"
+    return "eRepublik İleri Sayım & Hasar Avcısı Aktif!"
 
 def bot_loop():
     TOKEN = "8704453687:AAHrKY4bVuT0RaOtWoUcwlKxT_shuKqXO3Q"
@@ -26,9 +26,10 @@ def bot_loop():
     }
 
     SEEN_ALERTS = set()
+    round_track = {}  # Rauntların bot tarafından ilk görüldüğü anı ve süresini takip etmek için
 
     try:
-        requests.post(TG, json={"chat_id": CHAT_ID, "text": "🛡️ *Kademeli Savaş Avcısı Devrede (15 Dk & Hasar Kontrolü)*", "parse_mode": "Markdown"})
+        requests.post(TG, json={"chat_id": CHAT_ID, "text": "🚀 *İleri Sayım & Temiz Hasar Avcısı Devrede!*", "parse_mode": "Markdown"})
     except:
         pass
 
@@ -39,27 +40,8 @@ def bot_loop():
                 data = r.json()
                 battles_dict = data.get("battles", {})
                 countries_dict = data.get("countries", {})
+                current_time = time.time()
                 
-                # Sadece D4 ve Air (Div 4 ve 11) olan, son 15 dakikaya giren savaşları topla
-                target_list = []
-                
-                current_time = time.time() # eRepublik zaman damgası kontrolü için
-                
-                for b_id, kampanya in battles_dict.items():
-                    divler = kampanya.get("div", {})
-                    for sub_id, d_bilgi in divler.items():
-                        d_num = d_bilgi.get("div", 0)
-                        if d_num in [4, 11]:
-                            # Bitiş süresi kontrolü (end alanı saniye cinsinden bitiş zamanı tutar)
-                            end_time = d_bilgi.get("end")
-                            if end_time:
-                                remaining_seconds = end_time - current_time
-                                # Son 15 dakika (900 saniye) kaldıysa hedef listeye ekle
-                                if 0 < remaining_seconds <= 900:
-                                    target_list.endswith((b_id, sub_id, d_num, kampanya)) # Mantıksal ekleme aşağıda
-                            
-                # Kodun devamı için listeyi güvenli dolduralım
-                valid_targets = []
                 for b_id, kampanya in battles_dict.items():
                     bolge = kampanya.get("region", {}).get("name", "Bölge")
                     inv_id = str(kampanya.get("inv", {}).get("id"))
@@ -70,40 +52,49 @@ def bot_loop():
                     divler = kampanya.get("div", {})
                     for sub_id, d_bilgi in divler.items():
                         d_num = d_bilgi.get("div", 0)
+                        
                         if d_num in [4, 11]:
-                            end_time = d_bilgi.get("end")
-                            if end_time:
-                                rem = end_time - time.time()
-                                if 0 < rem <= 900:  # Son 15 dakika
-                                    valid_targets.append((b_id, sub_id, d_num, bolge, inv_name, def_name, d_bilgi))
-
-                # Bulunan hedefleri 3-4 dakikalık zamana yayarak (araya 10-15 saniye koyarak) kontrol et
-                if valid_targets:
-                    sleep_interval = max(5, 200 // len(valid_targets)) # Toplam süreyi yaymak için dinamik uyku
-                    
-                    for b_id, sub_id, d_num, bolge, inv_name, def_name, d_bilgi in valid_targets:
-                        co = d_bilgi.get("co", {})
-                        inv_c = co.get("inv", [])
-                        def_c = co.get("def", [])
-                        
-                        key = f"{b_id}_{sub_id}"
-                        
-                        # Eğer o roundda vuran kimse yoksa (listeler boşsa)
-                        if not inv_c and not def_c:
-                            if key not in SEEN_ALERTS:
-                                tur = "D4 KARA" if d_num == 4 else "AIR (SH)"
-                                rem_min = int((d_bilgi.get("end", 0) - time.time()) // 60)
-                                msg = f"🎯 *KRİTİK FIRSAT: BOŞ {tur}!*\n⚔️ {inv_name} vs {def_name}\n📍 Bölge: {bolge}\n⏳ Kalan Süre: ~{rem_min} dakika\n💎 Kimse vurmamış, taze alan!\n🔗 [Savaşa Git](https://www.erepublik.com/tr/military/battlefield/{b_id})"
-                                requests.post(TG, json={"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown"})
-                                SEEN_ALERTS.add(key)
-                        else:
-                            if key in SEEN_ALERTS:
-                                SEEN_ALERTS.remove(key)
+                            key = f"{b_id}_{sub_id}"
+                            
+                            # Eğer bu raundu ilk defa görüyorsak takip sözlüğüne ekleyelim
+                            if key not in round_track:
+                                round_track[key] = current_time
                                 
-                        # İstekler arasında yavaşlatma (Cloudflare'a takılmamak için)
-                        time.sleep(sleep_interval)
+                            # Raundun botumuzda ne kadar süredir aktif olduğunu hesaplıyoruz (İleri sayım mantığı)
+                            elapsed_duration = current_time - round_track[key]
+                            
+                            # Katkıda bulunanlar (vuranlar) kontrolü
+                            co = d_bilgi.get("co", {})
+                            inv_c = co.get("inv", [])
+                            def_c = co.get("def", [])
+                            
+                            # Kriter: Raundun sonlarına yaklaşılmış olması (örneğin bot tarafından 75+ dakikadır izleniyor veya API bitiş verisi oturmuş)
+                            # Veya doğrudan hiç vuran yoksa ve süre olgunlaşmışsa
+                            end_time = d_bilgi.get("end")
+                            
+                            # Eğer API end döndürüyorsa ve son 15 dakikaya girildiyse VEYA sayaç mantığıyla yeterince olgunlaştıysa
+                            is_late_game = False
+                            if end_time:
+                                rem = end_time - current_time
+                                if 0 < rem <= 900:  # Geri sayım tabanlı son 15 dk
+                                    is_late_game = True
+                            elif elapsed_duration > 4500:  # 75 dakika (1 saat 15 dk) geçenler son 15 dakikadadır
+                                is_late_game = True
+                                
+                            # Eğer son aşamadaysa VE o roundda hâlâ vuran kimse yoksa (temizse)
+                            if is_late_game and not inv_c and not def_c:
+                                if key not in SEEN_ALERTS:
+                                    tur = "D4 KARA" if d_num == 4 else "AIR (SH)"
+                                    msg = f"🎯 *SON DÜZLÜK & TEMİZ {tur} ALANI!*\n⚔️ {inv_name} vs {def_name}\n📍 Bölge: {bolge}\n💎 Süre ilerledi, henüz vuran yok (Temiz Round)!\n🔗 [Savaşa Git](https://www.erepublik.com/tr/military/battlefield/{b_id})"
+                                    requests.post(TG, json={"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown"})
+                                    SEEN_ALERTS.add(key)
+                            else:
+                                # Sonradan vurulan veya durumu değişen varsa listeden çıkar
+                                if key in SEEN_ALERTS and (inv_c or def_c):
+                                    SEEN_ALERTS.remove(key)
+                                    
+                    time.sleep(0.5) # Cloudflare'ı üzmemek için minik gecikme
 
-            # Döngü genelinde de nefes aldırıyoruz
             time.sleep(60)
         except Exception as e:
             time.sleep(30)
