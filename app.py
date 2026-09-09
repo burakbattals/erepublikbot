@@ -1,3 +1,4 @@
+
 import time
 import threading
 import requests
@@ -8,7 +9,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "eRepublik Detaylı Analiz Botu Aktif!"
+    return "eRepublik Detaylı Linkli Analiz Botu Aktif!"
 
 def bot_loop():
     TOKEN = "8704453687:AAHrKY4bVuT0RaOtWoUcwlKxT_shuKqXO3Q"
@@ -24,10 +25,10 @@ def bot_loop():
         "X-Requested-With": "XMLHttpRequest"
     }
 
-    debug_sent = False
+    sent_battles = set()
 
     try:
-        requests.post(TG, json={"chat_id": CHAT_ID, "text": "🔍 *Temiz Analiz Modu Başlatıldı!*", "parse_mode": "Markdown"})
+        requests.post(TG, json={"chat_id": CHAT_ID, "text": "🔍 *Linkli Divizyon Analiz Modu Başlatıldı!*", "parse_mode": "Markdown"})
     except:
         pass
 
@@ -37,28 +38,35 @@ def bot_loop():
             if r.status_code == 200:
                 data = r.json()
                 battles_dict = data.get("battles", {})
+                countries_dict = data.get("countries", {})
                 
-                if not debug_sent:
-                    for b_id, kampanya in battles_dict.items():
-                        divler = kampanya.get("div", {})
-                        for sub_id, d_bilgi in divler.items():
-                            d_num = d_bilgi.get("div", 0)
-                            if d_num in [4, 11]:
-                                # Sözlük içindeki tüm anahtarları alt alta düzgün formatta döküyoruz
-                                fields_str = "\n".join([f"• `{k}`: `{v}`" for k, v in d_bilgi.items()])
-                                msg = f"📊 *Divizyon {d_num} Alanları* (Battle: {b_id}):\n\n{fields_str}"
+                for b_id, kampanya in battles_dict.items():
+                    bolge = kampanya.get("region", {}).get("name", "Bölge")
+                    inv_id = str(kampanya.get("inv", {}).get("id"))
+                    def_id = str(kampanya.get("def", {}).get("id"))
+                    inv_name = countries_dict.get(inv_id, {}).get("name", "Saldırgan")
+                    def_name = countries_dict.get(def_id, {}).get("name", "Savunan")
+                    
+                    divler = kampanya.get("div", {})
+                    for sub_id, d_bilgi in divler.items():
+                        d_num = d_bilgi.get("div", 0)
+                        if d_num in [4, 11]:
+                            key = f"{b_id}_{sub_id}"
+                            if key not in sent_battles:
+                                tur = "D4 KARA" if d_num == 4 else "AIR (SH)"
                                 
-                                # Telegram mesaj boyu sınırına (4096 karakter) takılmamak için bölerek atalım
+                                # Divizyon içindeki tüm anahtarları ve değerleri listele
+                                fields = "\n".join([f"• `{k}`: `{v}`" for k, v in d_bilgi.items()])
+                                
+                                msg = f"📊 *{tur} İnceleme* (ID: {b_id})\n⚔️ {inv_name} vs {def_name}\n📍 Bölge: {bolge}\n🔗 [Savaşa Git](https://www.erepublik.com/tr/military/battlefield/{b_id})\n\n*Alanlar:*\n{fields}"
+                                
                                 if len(msg) > 4000:
                                     msg = msg[:4000]
                                     
                                 requests.post(TG, json={"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown"})
-                                debug_sent = True
-                                break
-                        if debug_sent:
-                            break
-
-            time.sleep(60)
+                                sent_battles.add(key)
+                                
+            time.sleep(120)
         except Exception as e:
             time.sleep(30)
 
