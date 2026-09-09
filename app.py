@@ -2,13 +2,13 @@ import time
 import threading
 import requests
 import os
-from flask import Flask
+from Flask import Flask
 
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "eRepublik İleri Sayım & Hasar Avcısı Aktif!"
+    return "eRepublik Skor Tabanlı Temiz Hasar Avcısı Aktif!"
 
 def bot_loop():
     TOKEN = "8704453687:AAHrKY4bVuT0RaOtWoUcwlKxT_shuKqXO3Q"
@@ -26,10 +26,9 @@ def bot_loop():
     }
 
     SEEN_ALERTS = set()
-    round_track = {}  # Rauntların bot tarafından ilk görüldüğü anı ve süresini takip etmek için
 
     try:
-        requests.post(TG, json={"chat_id": CHAT_ID, "text": "🚀 *İleri Sayım & Temiz Hasar Avcısı Devrede!*", "parse_mode": "Markdown"})
+        requests.post(TG, json={"chat_id": CHAT_ID, "text": "🎯 *Skor Tabanlı Temiz Hasar Avcısı Devrede!*", "parse_mode": "Markdown"})
     except:
         pass
 
@@ -40,7 +39,6 @@ def bot_loop():
                 data = r.json()
                 battles_dict = data.get("battles", {})
                 countries_dict = data.get("countries", {})
-                current_time = time.time()
                 
                 for b_id, kampanya in battles_dict.items():
                     bolge = kampanya.get("region", {}).get("name", "Bölge")
@@ -56,44 +54,46 @@ def bot_loop():
                         if d_num in [4, 11]:
                             key = f"{b_id}_{sub_id}"
                             
-                            # Eğer bu raundu ilk defa görüyorsak takip sözlüğüne ekleyelim
-                            if key not in round_track:
-                                round_track[key] = current_time
-                                
-                            # Raundun botumuzda ne kadar süredir aktif olduğunu hesaplıyoruz (İleri sayım mantığı)
-                            elapsed_duration = current_time - round_track[key]
+                            # Skor kontrolü (eRepublik'te inv_points ve def_points veya benzeri skor alanları olur)
+                            # Puanlardan herhangi biri 1350'yi geçtiyse son düzlüğe (son 15 dakikaya) girilmiştir
+                            inv_score = d_bilgi.get("inv_score", 0) or d_bilgi.get("inv_points", 0)
+                            def_score = d_bilgi.get("def_score", 0) or d_bilgi.get("def_points", 0)
                             
-                            # Katkıda bulunanlar (vuranlar) kontrolü
+                            # Alternatif olarak genel kampanya objesindeki skorlara da bakabiliriz
+                            # Eğer skor verisi doğrudan d_bilgi içinde yoksa, puanları kampanya genelinden alalım:
+                            if not inv_score:
+                                inv_score = kampanya.get("inv", {}).get("points", 0)
+                            if not def_score:
+                                def_score = kampanya.get("def", {}).get("points", 0)
+                                
+                            # Katkıda bulunanlar (vuranlar) listesi
                             co = d_bilgi.get("co", {})
                             inv_c = co.get("inv", [])
                             def_c = co.get("def", [])
                             
-                            # Kriter: Raundun sonlarına yaklaşılmış olması (örneğin bot tarafından 75+ dakikadır izleniyor veya API bitiş verisi oturmuş)
-                            # Veya doğrudan hiç vuran yoksa ve süre olgunlaşmışsa
+                            # Kriter: Skor 1350'yi geçtiyse VEYA API end süresi son 15 dakikadaysa
                             end_time = d_bilgi.get("end")
+                            current_time = time.time()
                             
-                            # Eğer API end döndürüyorsa ve son 15 dakikaya girildiyse VEYA sayaç mantığıyla yeterince olgunlaştıysa
-                            is_late_game = False
-                            if end_time:
-                                rem = end_time - current_time
-                                if 0 < rem <= 900:  # Geri sayım tabanlı son 15 dk
-                                    is_late_game = True
-                            elif elapsed_duration > 4500:  # 75 dakika (1 saat 15 dk) geçenler son 15 dakikadadır
-                                is_late_game = True
+                            is_late = False
+                            if end_time and (end_time - current_time) <= 900 and (end_time - current_time) > 0:
+                                is_late = True
+                            elif inv_score >= 1350 or def_score >= 1350:
+                                is_late = True
                                 
-                            # Eğer son aşamadaysa VE o roundda hâlâ vuran kimse yoksa (temizse)
-                            if is_late_game and not inv_c and not def_c:
+                            # Eğer son düzlükteyesek VE o roundda vuran kimse yoksa (listeler boşsa)
+                            if is_late and not inv_c and not def_c:
                                 if key not in SEEN_ALERTS:
                                     tur = "D4 KARA" if d_num == 4 else "AIR (SH)"
-                                    msg = f"🎯 *SON DÜZLÜK & TEMİZ {tur} ALANI!*\n⚔️ {inv_name} vs {def_name}\n📍 Bölge: {bolge}\n💎 Süre ilerledi, henüz vuran yok (Temiz Round)!\n🔗 [Savaşa Git](https://www.erepublik.com/tr/military/battlefield/{b_id})"
+                                    max_score = max(inv_score, def_score)
+                                    msg = f"💎 *KRİTİK FIRSAT: BOŞ {tur}!*\n⚔️ {inv_name} vs {def_name}\n📍 Bölge: {bolge}\n📊 Skor: {inv_score} - {def_score} (Son Düzlük!)\n🚀 Kimse vurmamış, madalya tarlası!\n🔗 [Savaşa Git](https://www.erepublik.com/tr/military/battlefield/{b_id})"
                                     requests.post(TG, json={"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown"})
                                     SEEN_ALERTS.add(key)
                             else:
-                                # Sonradan vurulan veya durumu değişen varsa listeden çıkar
                                 if key in SEEN_ALERTS and (inv_c or def_c):
                                     SEEN_ALERTS.remove(key)
                                     
-                    time.sleep(0.5) # Cloudflare'ı üzmemek için minik gecikme
+                    time.sleep(0.5)
 
             time.sleep(60)
         except Exception as e:
