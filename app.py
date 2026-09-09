@@ -70,11 +70,9 @@ def bot_loop():
                     for sub_id, d_bilgi in divler.items():
                         d_num = d_bilgi.get("div", 0)
                         
-                        # Sadece Div 4 (4) ve Air (11) alınıyor
                         if d_num in [4, 11]:
                             key = f"{b_id}_{sub_id}"
                             
-                            # Skorları tüm olası yollardan güvenli şekilde çekelim
                             inv_score = (
                                 d_bilgi.get("inv_score", 0) or 
                                 d_bilgi.get("inv_points", 0) or 
@@ -88,16 +86,15 @@ def bot_loop():
                                 kampanya.get("def", {}).get("points", 0)
                             )
                             
-                            # Sayısal değere dönüştürme garantisi
                             try:
                                 inv_score = int(inv_score)
                             except:
                                 inv_score = 0
+                                
                             try:
                                 def_score = int(def_score)
-                            goose = 0
-                        except:
-                            def_score = 0
+                            except:
+                                def_score = 0
                             
                             co = d_bilgi.get("co", {})
                             inv_c = co.get("inv", [])
@@ -110,7 +107,6 @@ def bot_loop():
                             elif inv_score >= 1350 or def_score >= 1350:
                                 is_late = True
                                 
-                            # Taraflardan herhangi birinin listesi boşsa ve son düzlükteyesek yakala
                             if is_late and (not inv_c or not def_c):
                                 if key not in SEEN_ALERTS:
                                     tur = "D4 KARA" if d_num == 4 else "AIR (SH)"
