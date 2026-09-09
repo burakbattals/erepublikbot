@@ -8,7 +8,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "eRepublik Veri Analiz Botu Aktif!"
+    return "eRepublik Detaylı Analiz Botu Aktif!"
 
 def bot_loop():
     TOKEN = "8704453687:AAHrKY4bVuT0RaOtWoUcwlKxT_shuKqXO3Q"
@@ -27,7 +27,7 @@ def bot_loop():
     debug_sent = False
 
     try:
-        requests.post(TG, json={"chat_id": CHAT_ID, "text": "🔍 *Divizyon Veri Analizi Başlatıldı!*", "parse_mode": "Markdown"})
+        requests.post(TG, json={"chat_id": CHAT_ID, "text": "🔍 *Temiz Analiz Modu Başlatıldı!*", "parse_mode": "Markdown"})
     except:
         pass
 
@@ -38,14 +38,21 @@ def bot_loop():
                 data = r.json()
                 battles_dict = data.get("battles", {})
                 
-                # Sadece bir kez çalışıp D4 veya Air divizyonunun içindeki ham veriyi atacak
                 if not debug_sent:
                     for b_id, kampanya in battles_dict.items():
                         divler = kampanya.get("div", {})
                         for sub_id, d_bilgi in divler.items():
                             d_num = d_bilgi.get("div", 0)
                             if d_num in [4, 11]:
-                                requests.post(TG, json={"chat_id": CHAT_ID, "text": f"📊 *Divizyon Verisi (Div {d_num})*:\n`{str(d_bilgi)}`", "parse_mode": "Markdown"})
+                                # Sözlük içindeki tüm anahtarları alt alta düzgün formatta döküyoruz
+                                fields_str = "\n".join([f"• `{k}`: `{v}`" for k, v in d_bilgi.items()])
+                                msg = f"📊 *Divizyon {d_num} Alanları* (Battle: {b_id}):\n\n{fields_str}"
+                                
+                                # Telegram mesaj boyu sınırına (4096 karakter) takılmamak için bölerek atalım
+                                if len(msg) > 4000:
+                                    msg = msg[:4000]
+                                    
+                                requests.post(TG, json={"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown"})
                                 debug_sent = True
                                 break
                         if debug_sent:
