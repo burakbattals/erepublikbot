@@ -1,100 +1,26 @@
-import time
-import threading
-import requests
-import os
-import re
-from flask import Flask
+# requests.Session() kullanarak çerezlerin ve oturumun istekler arasında taşınmasını sağlıyoruz
+    session = requests.Session()
+    session.headers.update(HDR)
 
-app = Flask(__name__)
-
-@app.route('/')
-def home():
-    return "eRepublik Akilli Dedektor Bot Aktif!"
-
-def bot_loop():
-    # --- ONEMLI: Bunlari Render dashboard'unda "Environment" sekmesinden
-    # environment variable olarak ekleyin (TG_TOKEN, TG_CHAT_ID, EREPUBLIK_COOKIE).
-    # Kod icinde birakmak, repo'yu paylastiginizda tokeninizin calinmasina yol acar.
-    TOKEN = os.environ.get("TG_TOKEN", "8704453687:AAHrKY4bVuT0RaOtWoUcwlKxT_shuKqXO3Q")
-    CHAT_ID = os.environ.get("TG_CHAT_ID", "8680653965")
-    USER_COOKIE = os.environ.get("EREPUBLIK_COOKIE", "l_chathwe=1; ...BURAYA_KENDI_COOKIENIZI_KOYUN...")
-
-    TG = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    URL = "https://www.erepublik.com/tr/military/campaigns-new"
-
-    # --- SABITLER (Render Environment sekmesinden gecici olarak degistirilebilir) ---
-    ROUND_DURATION = 5400        # 90 dakika = 5400 saniye (oyun ici round suresi)
-
-    # TEST ICIN: Render'da ALERT_AT_ELAPSED_SEC=600 yaparsaniz esik 10 dakikaya
-    # duser, boylece 75 dakika beklemeden bildirim gelip gelmedigini gorursunuz.
-    # Testi bitirince bu env variable'i SILIN (ya da 4500 yapin) - normale doner.
-    ALERT_AT_ELAPSED = int(os.environ.get("ALERT_AT_ELAPSED_SEC", "4500"))
-
-    # TEST ICIN: RW_COOLDOWN_SEC ve RW_WARN_WINDOW_SEC ile de kisa devre test
-    # yapabilirsiniz (ornegin RW_COOLDOWN_SEC=300, RW_WARN_WINDOW_SEC=60 yaparsaniz
-    # bir savas bittikten ~4 dakika sonra RW uyarisini gorursunuz). Normalde:
-    RW_COOLDOWN = int(os.environ.get("RW_COOLDOWN_SEC", "86400"))       # 24 saat
-    RW_WARN_WINDOW = int(os.environ.get("RW_WARN_WINDOW_SEC", "300"))   # bitise 5dk kala uyar
-    DEBUG = os.environ.get("DEBUG", "0") == "1"  # Render env'de DEBUG=1 yaparsaniz ham JSON'u loglar
-
-    HDR = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "application/json, text/javascript, */*; q=0.01",
-        "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Cookie": USER_COOKIE,
-        "X-Requested-With": "XMLHttpRequest",
-        "Referer": "https://www.erepublik.com/tr/main/index"
-    }
-
-    SEEN_ALERTS = set()
-    previous_battles = {}
-    ended_rw_tracker = {}
-    rw_alerts_sent = set()
-    round_start_tracker = {}  # battleZoneId -> ilk gorduğumuz an (round baslangici tahmini)
-
-    def send_tg(text):
+    def fetch_csrf_token(b_id):
         try:
-            resp = requests.post(TG, json={"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"}, timeout=10)
-            if resp.status_code != 200:
-                print(f"Telegram gonderim hatasi: {resp.status_code} {resp.text[:200]}")
-        except Exception as e:
-            print(f"Telegram gonderim istisnasi: {e}")
-
-    # --- CSRF TOKEN ---
-    # battle-console endpoint'i (gercek zamanli fighter listesi) POST istegi
-    # icinde bir _token (CSRF) istiyor. Onceden "/tr/main/index" sayfasindan
-    # cekmeye calisiyorduk ama o sayfa token'i icermiyor gibi gorunuyor.
-    # Bunun yerine, zaten test edip calistigini dogruladigimiz fighterStatistics
-    # sayfasindan (ayni battleId/battleZoneId icin), tam kontrol ani gelince
-    # taze taze cekiyoruz - hem garanti calisir hem hep guncel olur.
-    def fetch_csrf_token(b_id, sub_id):
-        try:
-            url = f"https://www.erepublik.com/tr/military/battlefield/{b_id}/{sub_id}/fighterStatistics"
-            resp = requests.get(url, headers=HDR, timeout=10)
-            # Hem "var csrfToken = '...'" hem de SERVER_DATA icindeki
-            # "csrfToken":"..." formatini (tek/cift tirnak farketmeksizin) yakala.
+            # Ana savaş sayfasından güncel tokeni alıyoruz
+            url = f"https://www.erepublik.com/tr/military/battlefield/{b_id}"
+            resp = session.get(url, timeout=10)
+            
             m = re.search(r"csrfToken[\"']?\s*[:=]\s*[\"']([a-f0-9]{20,40})[\"']", resp.text)
             if m:
                 if DEBUG:
-                    print(f"[TANI] csrfToken alindi ({b_id}/{sub_id}): {m.group(1)[:8]}...")
+                    print(f"[TANI] csrfToken alindi ({b_id}): {m.group(1)[:8]}...")
                 return m.group(1)
 
-            print(f"[TANI] csrfToken bulunamadi ({b_id}/{sub_id}). Yanit uzunlugu: {len(resp.text)}, "
-                  f"status: {resp.status_code}")
-            if DEBUG:
-                idx = resp.text.lower().find("csrf")
-                if idx != -1:
-                    print(f"[TANI] 'csrf' gecen yer (baglam): ...{resp.text[max(0,idx-60):idx+120]}...")
-                else:
-                    print(f"[TANI] Yanitta 'csrf' kelimesi hic gecmiyor. Basi: {resp.text[:500]}")
+            print(f"[TANI] csrfToken bulunamadi ({b_id}). Status: {resp.status_code}")
         except Exception as e:
             print(f"csrfToken cekme hatasi: {e}")
         return None
 
     def check_fighters(b_id, round_number, d_num, sub_id, inv_id, def_id):
-        """battle-console'dan gercek zamanli fighter listesini ceker.
-        Donus: (inv_has_fighter, def_has_fighter) ya da bilinmiyorsa (None, None)."""
-        token = fetch_csrf_token(b_id, sub_id)
+        token = fetch_csrf_token(b_id)
         if not token:
             return None, None
 
@@ -112,8 +38,9 @@ def bot_loop():
         }
 
         try:
-            resp = requests.post("https://www.erepublik.com/tr/military/battle-console",
-                                  data=body, headers=HDR, timeout=10)
+            # session.post kullanarak oturum çerezleriyle birlikte istek atıyoruz
+            resp = session.post("https://www.erepublik.com/tr/military/battle-console",
+                                  data=body, timeout=10)
             if DEBUG:
                 print(f"-> battle-console istek ({b_id}/{d_num}/{sub_id}) status: {resp.status_code}")
 
@@ -132,204 +59,3 @@ def bot_loop():
         except Exception as ex:
             print(f"battle-console istek hatasi: {ex}")
             return None, None
-
-    send_tg("Akilli Dedektor eRepublik Botu Baslatildi!")
-    print("Bot baslatildi ve Telegram'a bilgi mesaji gonderildi.")
-
-    while True:
-        try:
-            r = requests.get(URL, headers=HDR, timeout=10)
-
-            # --- COOKIE / CLOUDFLARE TANI ---
-            # cf_clearance cookie'si genelde IP/tarayici parmak izine baglidir.
-            # Bu cookie'yi kendi bilgisayarinizda alip Render'in sunucu IP'sinden
-            # kullaniyorsunuz; Cloudflare bunu reddedip HTML challenge sayfasi
-            # donebilir. Asagidaki loglar bunu tespit etmenizi saglar.
-            if r.status_code != 200:
-                print(f"[TANI] Kampanya istegi basarisiz: status={r.status_code}, body_basi={r.text[:200]}")
-                time.sleep(60)
-                continue
-
-            content_type = r.headers.get("Content-Type", "")
-            if "json" not in content_type:
-                print(f"[TANI] Beklenmeyen Content-Type: {content_type}. "
-                      f"Muhtemelen Cloudflare challenge/login sayfasi donuyor. "
-                      f"Cookie'nin gecerliligini ve Render IP'sinden erisimi kontrol edin.")
-                print(f"[TANI] Yanit basi: {r.text[:300]}")
-                time.sleep(60)
-                continue
-
-            try:
-                data = r.json()
-            except Exception as e:
-                print(f"Kampanya JSON okuma hatasi: {e} | Yanit basi: {r.text[:300]}")
-                time.sleep(60)
-                continue
-
-            battles_dict = data.get("battles", {})
-            countries_dict = data.get("countries", {})
-            # Render sunucusunun saati yerine oyunun kendi sunucu saatini kullaniyoruz
-            # (JSON'un en ustundeki "time" alani) - saat kaymasi olasiligini ortadan kaldirir.
-            current_time = data.get("time", time.time())
-
-            # --- BITEN SAVASLARI TESPIT ET (RW cooldown takibi icin) ---
-            current_battle_ids = set(battles_dict.keys())
-            if previous_battles:
-                ended_ids = set(previous_battles.keys()) - current_battle_ids
-                for e_id in ended_ids:
-                    b_info = previous_battles[e_id]
-                    ended_rw_tracker[e_id] = {
-                        "end_time": current_time,
-                        "region": b_info.get("region_name", "Bolge"),
-                        "inv_name": b_info.get("inv_name", "?"),
-                        "def_name": b_info.get("def_name", "?"),
-                    }
-
-            previous_battles.clear()
-            active_zone_ids = set()
-
-            for b_id, kampanya in battles_dict.items():
-                bolge = kampanya.get("region", {}).get("name", "Bolge")
-                inv_id = str(kampanya.get("inv", {}).get("id"))
-                def_id = str(kampanya.get("def", {}).get("id"))
-                inv_name = countries_dict.get(inv_id, {}).get("name", "Saldirgan")
-                def_name = countries_dict.get(def_id, {}).get("name", "Savunan")
-
-                previous_battles[b_id] = {
-                    "region_name": bolge,
-                    "inv_name": inv_name,
-                    "def_name": def_name,
-                }
-
-                divler = kampanya.get("div", {})
-                for sub_id, d_bilgi in divler.items():
-                    d_num = d_bilgi.get("div", 0)
-
-                    # SADECE Div4 (kara) ve Div11 (hava) icin kontrol.
-                    # Bu ID'lerin dogrulugunu oyun icinden teyit edin; farkliysa buradan degistirin.
-                    if d_num not in [4, 11]:
-                        continue
-
-                    key = f"{b_id}_{sub_id}"
-
-                    # ONEMLI KESIF: aktif (bitmemis) round'larda "end" alani None geliyor,
-                    # sadece round bittiginde doluyor. Yani sunucu bize aktif round icin
-                    # bitis zamani vermiyor - kendi zamanlamamizi tutmamiz gerekiyor.
-                    is_round_finished = d_bilgi.get("division_end", False)
-                    if is_round_finished:
-                        # Bu round bitmis - takipten cikar, yeni round baska bir
-                        # battleZoneId (sub_id) ile JSON'a dusecek.
-                        round_start_tracker.pop(sub_id, None)
-                        continue
-
-                    active_zone_ids.add(sub_id)
-
-                    if sub_id not in round_start_tracker:
-                        # Bu battleZoneId'yi ilk kez goruyoruz - simdiki zamani
-                        # yaklasik baslangic kabul ediyoruz (60sn'lik dongu payinda
-                        # en fazla ~60sn hata olur, 15dk'lik alarm penceresi icin ihmal edilebilir).
-                        round_start_tracker[sub_id] = current_time
-                        continue
-
-                    start_time = round_start_tracker[sub_id]
-                    elapsed_seconds = current_time - start_time
-                    remaining_seconds = ROUND_DURATION - elapsed_seconds
-                    is_late = elapsed_seconds >= ALERT_AT_ELAPSED and remaining_seconds > 0
-
-                    tur_adi = "D4" if d_num == 4 else "AIR"
-                    if DEBUG:
-                        print(f"[{tur_adi}] Bolge: {bolge} (ID: {b_id}) | Gecen: {elapsed_seconds/60:.1f}dk | "
-                              f"Kalan: {remaining_seconds/60:.1f}dk | 1s15dk gecti mi?: {is_late}")
-
-                    if not is_late:
-                        continue
-
-                    # Not: eski "fighterStatistics" URL'i sadece HTML donuyordu, "battle-stats"
-                    # da gecikmeli/eski veri veriyordu (gercek dovusu "bos" sandi). Artik gercek
-                    # zamanli fighter listesini donen battle-console kullaniliyor.
-                    round_number = kampanya.get("zone_id")
-                    inv_has_fighter, def_has_fighter = check_fighters(
-                        b_id, round_number, d_num, sub_id, inv_id, def_id
-                    )
-
-                    if DEBUG:
-                        print(f"   -> Sonuc: {inv_name} vuruyor mu?: {inv_has_fighter} | "
-                              f"{def_name} vuruyor mu?: {def_has_fighter}")
-
-                    is_open_target = False
-                    status_desc = ""
-
-                    if inv_has_fighter is None or def_has_fighter is None:
-                        # Veri alinamadi (token sorunu, network vb.) - emin olmadan
-                        # bildirim atmayalim, bir sonraki dongude tekrar denenecek.
-                        pass
-                    elif not inv_has_fighter and not def_has_fighter:
-                        is_open_target = True
-                        status_desc = "Iki taraf da tamamen bos!"
-                    elif inv_has_fighter and not def_has_fighter:
-                        is_open_target = True
-                        status_desc = f"`{def_name}` tarafi bos (Sadece {inv_name} vuruyor)!"
-                    elif def_has_fighter and not inv_has_fighter:
-                        is_open_target = True
-                        status_desc = f"`{inv_name}` tarafi bos (Sadece {def_name} vuruyor)!"
-
-                    if is_open_target:
-                        if key not in SEEN_ALERTS:
-                            tur = "D4 KARA" if d_num == 4 else "AIR (SH)"
-                            msg = (f"1s15dk GECTI - BOS {tur} FIRSATI!\n"
-                                   f"{inv_name} vs {def_name}\n"
-                                   f"Bolge: {bolge}\n"
-                                   f"{status_desc}\n"
-                                   f"Savasa Git: https://www.erepublik.com/tr/military/battlefield/{b_id}")
-                            send_tg(msg)
-                            print(f"ALARM GONDERILDI -> Bolge: {bolge}")
-                            SEEN_ALERTS.add(key)
-                    else:
-                        SEEN_ALERTS.discard(key)
-
-                time.sleep(0.3)
-
-            # Artik JSON'da hic gorunmeyen (b_id degisti, round bambaska sekilde
-            # kapandi vb.) eski battleZoneId kayitlarini temizle.
-            for old_zone_id in list(round_start_tracker.keys()):
-                if old_zone_id not in active_zone_ids:
-                    round_start_tracker.pop(old_zone_id, None)
-
-            # --- RW COOLDOWN KONTROLU ---
-            for b_id, track in list(ended_rw_tracker.items()):
-                elapsed = current_time - track["end_time"]
-
-                if RW_COOLDOWN - RW_WARN_WINDOW <= elapsed < RW_COOLDOWN and b_id not in rw_alerts_sent:
-                    rw_msg = (f"RW COOLDOWN UYARISI!\n"
-                              f"Bolge: {track['region']}\n"
-                              f"Ulkeler: {track['inv_name']} vs {track['def_name']}\n"
-                              f"Savasin bitiminden beri 24 saate 5 dakika kaldi!\n"
-                              f"Isyan (RW) acmak icin hazirlik yapin.")
-                    send_tg(rw_msg)
-                    rw_alerts_sent.add(b_id)
-                elif elapsed >= RW_COOLDOWN:
-                    del ended_rw_tracker[b_id]
-                    rw_alerts_sent.discard(b_id)
-
-            time.sleep(60)
-        except Exception as e:
-            print(f"Ana dongu hatasi: {e}")
-            time.sleep(30)
-
-# --- ONEMLI ---
-# Thread'i modul seviyesinde (if __name__ disinda) baslatiyoruz. Render'da
-# start command "gunicorn app:app" gibi bir sey ise, dosya "import" edilir,
-# dogrudan calistirilmaz; "if __name__ == '__main__':" bloğu hic tetiklenmez
-# ve bot thread'i hic baslamazdi (hata da vermez, sessizce hicbir sey yapmaz).
-# Bu satirlar sayede thread, dosya nasil calistirilirsa calistirilsin baslar.
-#
-# UYARI: Render'da worker sayisi 1'den fazlaysa (ör. gunicorn -w 4) bu kod
-# her worker'da ayri calisip AYNI Telegram mesajini birden fazla gonderir.
-# Free/Starter planlarda genelde tek worker oldugu icin sorun olmaz, ama
-# start command'inizde "-w" veya "--workers" gibi bir ayar varsa bana bildirin.
-_bot_thread = threading.Thread(target=bot_loop, daemon=True)
-_bot_thread.start()
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
