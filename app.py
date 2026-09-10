@@ -62,32 +62,32 @@ def bot_loop():
 
     # --- CSRF TOKEN ---
     # battle-console endpoint'i (gercek zamanli fighter listesi) POST istegi
-    # icinde bir _token (CSRF) istiyor. Bu token normal bir HTML sayfasinin
-    # icindeki "var csrfToken = '...';" satirindan geliyor ve oturum boyunca
-    # sabit kalıyor gibi gorunuyor - bu yuzden bir kez cekip onbellekte
-    # tutuyoruz, sadece bir istek basarisiz olursa yeniliyoruz.
-    csrf_token = {"value": None}
-
-    def fetch_csrf_token():
+    # icinde bir _token (CSRF) istiyor. Onceden "/tr/main/index" sayfasindan
+    # cekmeye calisiyorduk ama o sayfa token'i icermiyor gibi gorunuyor.
+    # Bunun yerine, zaten test edip calistigini dogruladigimiz fighterStatistics
+    # sayfasindan (ayni battleId/battleZoneId icin), tam kontrol ani gelince
+    # taze taze cekiyoruz - hem garanti calisir hem hep guncel olur.
+    def fetch_csrf_token(b_id, sub_id):
         try:
-            resp = requests.get("https://www.erepublik.com/tr/main/index", headers=HDR, timeout=10)
+            url = f"https://www.erepublik.com/tr/military/battlefield/{b_id}/{sub_id}/fighterStatistics"
+            resp = requests.get(url, headers=HDR, timeout=10)
             m = re.search(r"var\s+csrfToken\s*=\s*'([^']+)'", resp.text)
             if m:
-                csrf_token["value"] = m.group(1)
                 if DEBUG:
-                    print(f"[TANI] csrfToken alindi: {csrf_token['value'][:8]}...")
-                return True
-            print(f"[TANI] csrfToken bulunamadi. Yanit basi: {resp.text[:300]}")
+                    print(f"[TANI] csrfToken alindi ({b_id}/{sub_id}): {m.group(1)[:8]}...")
+                return m.group(1)
+            print(f"[TANI] csrfToken bulunamadi ({b_id}/{sub_id}). Yanit uzunlugu: {len(resp.text)}, "
+                  f"status: {resp.status_code}")
         except Exception as e:
             print(f"csrfToken cekme hatasi: {e}")
-        return False
+        return None
 
     def check_fighters(b_id, round_number, d_num, sub_id, inv_id, def_id):
         """battle-console'dan gercek zamanli fighter listesini ceker.
         Donus: (inv_has_fighter, def_has_fighter) ya da bilinmiyorsa (None, None)."""
-        if not csrf_token["value"]:
-            if not fetch_csrf_token():
-                return None, None
+        token = fetch_csrf_token(b_id, sub_id)
+        if not token:
+            return None, None
 
         body = {
             "battleId": b_id,
@@ -99,41 +99,33 @@ def bot_loop():
             "type": "damage",
             "leftPage": 1,
             "rightPage": 1,
-            "_token": csrf_token["value"],
+            "_token": token,
         }
 
-        for attempt in range(2):  # ilk deneme basarisizsa token'i yenileyip bir kez daha dene
-            try:
-                resp = requests.post("https://www.erepublik.com/tr/military/battle-console",
-                                      data=body, headers=HDR, timeout=10)
+        try:
+            resp = requests.post("https://www.erepublik.com/tr/military/battle-console",
+                                  data=body, headers=HDR, timeout=10)
+            if DEBUG:
+                print(f"-> battle-console istek ({b_id}/{d_num}/{sub_id}) status: {resp.status_code}")
+
+            if resp.status_code == 200 and "json" in resp.headers.get("Content-Type", ""):
+                resp_data = resp.json()
                 if DEBUG:
-                    print(f"-> battle-console istek ({b_id}/{d_num}/{sub_id}) status: {resp.status_code}")
+                    print(f"[TANI] battle-console JSON: {str(resp_data)[:1500]}")
 
-                if resp.status_code == 200 and "json" in resp.headers.get("Content-Type", ""):
-                    resp_data = resp.json()
-                    if DEBUG:
-                        print(f"[TANI] battle-console JSON: {str(resp_data)[:1500]}")
-
-                    inv_fd = resp_data.get(str(inv_id), {}).get("fighterData", {})
-                    def_fd = resp_data.get(str(def_id), {}).get("fighterData", {})
-                    return (len(inv_fd) > 0, len(def_fd) > 0)
-                else:
-                    if DEBUG:
-                        print(f"[TANI] battle-console beklenmeyen yanit: {resp.status_code} {resp.text[:200]}")
-                    # Token gecersiz/suresi dolmus olabilir - yenileyip tekrar dene
-                    body["_token"] = None
-                    if not fetch_csrf_token():
-                        return None, None
-                    body["_token"] = csrf_token["value"]
-            except Exception as ex:
-                print(f"battle-console istek hatasi: {ex}")
+                inv_fd = resp_data.get(str(inv_id), {}).get("fighterData", {})
+                def_fd = resp_data.get(str(def_id), {}).get("fighterData", {})
+                return (len(inv_fd) > 0, len(def_fd) > 0)
+            else:
+                if DEBUG:
+                    print(f"[TANI] battle-console beklenmeyen yanit: {resp.status_code} {resp.text[:200]}")
                 return None, None
-
-        return None, None
+        except Exception as ex:
+            print(f"battle-console istek hatasi: {ex}")
+            return None, None
 
     send_tg("Akilli Dedektor eRepublik Botu Baslatildi!")
     print("Bot baslatildi ve Telegram'a bilgi mesaji gonderildi.")
-    fetch_csrf_token()
 
     while True:
         try:
