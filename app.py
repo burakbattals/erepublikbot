@@ -77,15 +77,29 @@ def bot_loop():
             return None
 
     def fetch_table_rows(url):
-        """Sayfadaki ilk <table>'i bulup her satiri <td> listesi olarak dondurur."""
+        """Sayfada 'Link' basligi olan tabloyu bulup her satiri <td> listesi olarak
+        dondurur. Bazi urun sayfalarinda (Ekmek gibi kaliteli/islemis urunler) asil
+        'Available Offers' tablosundan ONCE, linksiz bir 'En Iyi Fiyat' ozet tablosu
+        geliyor - sayfadaki ILK tabloyu almak o ozet tabloyu yakalayip linksiz
+        (bos link) sonuc veriyordu. Artik "Link" basligi olan dogru tabloyu ariyoruz.
+        """
         resp = requests.get(url, headers=HDR, timeout=15)
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "html.parser")
-        table = soup.find("table")
-        if not table:
+
+        target_table = None
+        for table in soup.find_all("table"):
+            headers = [th.get_text(strip=True) for th in table.find_all("th")]
+            if any("Link" in h for h in headers):
+                target_table = table
+                break
+        if target_table is None:
+            target_table = soup.find("table")  # yedek: hicbiri "Link" icermiyorsa ilkini dene
+
+        if not target_table:
             return []
         rows = []
-        for tr in table.find_all("tr"):
+        for tr in target_table.find_all("tr"):
             tds = tr.find_all("td")
             if tds:
                 rows.append(tds)
