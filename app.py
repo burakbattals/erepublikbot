@@ -32,27 +32,45 @@ def bot_loop():
     JOB_URL = "https://erepublik.tools/en/marketplace/jobs/0/offers"
 
     # --- TAKIP EDILECEK URUNLER ---
-    # Format: "Etiket1=URL1,Etiket2=URL2,..."
+    # Format: "Etiket1|URL1|MinMiktar1,Etiket2|URL2|MinMiktar2,..."
+    # MinMiktar: bir ilan bu adetten azsa "en dusuk fiyat" hesabina katilmaz.
+    # 0 = miktar filtresi yok (ozellikle Ev gibi az adetli satilan urunler icin).
     # Render'da ITEM_WATCH_URLS environment variable'ini bu formatta
-    # tanimlarsaniz asagidaki varsayilanlarin YERINE onlar kullanilir.
-    # Ornegin hava silahi Q5 linkini bulunca, mevcut listeye ekleyip
-    # ayni formatta (virgulle ayirarak) Render'a girmeniz yeterli - kod
-    # degismesine gerek yok.
+    # tanimlarsaniz asagidaki varsayilanlarin YERINE onlar kullanilir - kod
+    # degistirmeden yeni urun eklemek/cikarmak icin bu degiskeni kullanin.
     DEFAULT_ITEMS = (
-        "Ekmek Q1=https://erepublik.tools/en/marketplace/items/0/1/1/offers,"
-        "FRM Hammadde=https://erepublik.tools/en/marketplace/items/0/7/1/offers,"
-        "WRM Hammadde=https://erepublik.tools/en/marketplace/items/0/12/1/offers,"
-        "HRM Hammadde=https://erepublik.tools/en/marketplace/items/0/17/1/offers,"
-        "ARM Hammadde=https://erepublik.tools/en/marketplace/items/0/24/1/offers,"
-        "Hava Silahi Q5=https://erepublik.tools/en/marketplace/items/0/23/5/offers"
+        "Ekmek Q1|https://erepublik.tools/en/marketplace/items/0/1/1/offers|500,"
+        "FRM Hammadde|https://erepublik.tools/en/marketplace/items/0/7/1/offers|5,"
+        "WRM Hammadde|https://erepublik.tools/en/marketplace/items/0/12/1/offers|5,"
+        "HRM Hammadde|https://erepublik.tools/en/marketplace/items/0/17/1/offers|5,"
+        "ARM Hammadde|https://erepublik.tools/en/marketplace/items/0/24/1/offers|5,"
+        "Hava Silahi Q5|https://erepublik.tools/en/marketplace/items/0/23/5/offers|5,"
+        "Ev Q1|https://erepublik.tools/en/marketplace/items/0/4/1/offers|0,"
+        "Ev Q2|https://erepublik.tools/en/marketplace/items/0/4/2/offers|0,"
+        "Ev Q3|https://erepublik.tools/en/marketplace/items/0/4/3/offers|0,"
+        "Ev Q4|https://erepublik.tools/en/marketplace/items/0/4/4/offers|0,"
+        "Ev Q5|https://erepublik.tools/en/marketplace/items/0/4/5/offers|0"
     )
     items_raw = os.environ.get("ITEM_WATCH_URLS", DEFAULT_ITEMS)
-    ITEM_URLS = {}
-    for pair in items_raw.split(","):
-        pair = pair.strip()
-        if "=" in pair:
-            label, url = pair.split("=", 1)
+    ITEM_URLS = {}       # label -> url
+    ITEM_MIN_QTY = {}    # label -> minimum miktar
+    for entry in items_raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        parts = entry.split("|")
+        if len(parts) == 3:
+            label, url, min_qty = parts
             ITEM_URLS[label.strip()] = url.strip()
+            try:
+                ITEM_MIN_QTY[label.strip()] = float(min_qty.strip())
+            except ValueError:
+                ITEM_MIN_QTY[label.strip()] = 0
+        elif len(parts) == 1 and "=" in parts[0]:
+            # Eski format (Etiket=URL) ile geriye donuk uyumluluk - min miktar 0 kabul edilir
+            label, url = parts[0].split("=", 1)
+            ITEM_URLS[label.strip()] = url.strip()
+            ITEM_MIN_QTY[label.strip()] = 0
 
     HDR = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -159,30 +177,35 @@ def bot_loop():
     def check_items():
         for label, url in ITEM_URLS.items():
             try:
+                min_qty = ITEM_MIN_QTY.get(label, 0)
                 rows = fetch_table_rows(url)
                 if DEBUG:
-                    print(f"[TANI] {label} - satir sayisi: {len(rows)}")
+                    print(f"[TANI] {label} - satir sayisi: {len(rows)}, min miktar: {min_qty}")
 
-                best = None  # (price, link)
+                best = None  # (price, link, amount)
                 for tds in rows:
                     if len(tds) < 5:
                         continue
+                    amount = parse_number(tds[2].get_text(strip=True))
                     price = parse_number(tds[3].get_text(strip=True))
                     link_tag = tds[4].find("a")
                     link = link_tag["href"] if link_tag and link_tag.has_attr("href") else ""
 
                     if price is None:
                         continue
+                    if min_qty > 0 and (amount is None or amount < min_qty):
+                        continue  # cok az miktarli ilanlari yok say
                     if best is None or price < best[0]:
-                        best = (price, link)
+                        best = (price, link, amount)
 
                 if not best:
-                    print(f"[TANI] {label} tablosu parse edilemedi (satir bulunamadi).")
+                    print(f"[TANI] {label} tablosu parse edilemedi "
+                          f"(en az {min_qty} adetlik ilan bulunamadi).")
                     continue
 
-                price, link = best
+                price, link, amount = best
                 if DEBUG:
-                    print(f"[TANI] {label} en dusuk fiyat: {price}")
+                    print(f"[TANI] {label} en dusuk fiyat: {price} ({amount} adet)")
 
                 if label in last_lowest_price:
                     baseline = last_lowest_price[label]
