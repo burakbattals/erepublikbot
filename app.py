@@ -3,15 +3,34 @@ import threading
 import requests
 import os
 import re
-from flask import Flask
+from flask import Flask, jsonify
 from bs4 import BeautifulSoup
 
 app = Flask(__name__)
+
+# Tampermonkey scripti (tarayici tarafi) bu listeyi periyodik cekip kendi
+# panelinde gosterebilsin diye son bildirimleri hafizada tutuyoruz. Thread-safe
+# olmasi icin basit bir kilit kullaniyoruz.
+_recent_alerts = []
+_recent_alerts_lock = threading.Lock()
+MAX_RECENT_ALERTS = 30
+
+
+def _record_alert(text):
+    with _recent_alerts_lock:
+        _recent_alerts.insert(0, {"time": time.time(), "text": text})
+        del _recent_alerts[MAX_RECENT_ALERTS:]
 
 
 @app.route('/')
 def home():
     return "erepublik.tools Market Watcher Bot Aktif!"
+
+
+@app.route('/recent-alerts')
+def recent_alerts():
+    with _recent_alerts_lock:
+        return jsonify(list(_recent_alerts))
 
 
 def bot_loop():
@@ -80,6 +99,7 @@ def bot_loop():
     }
 
     def send_tg(text):
+        _record_alert(text)
         try:
             resp = requests.post(TG, json={"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"}, timeout=10)
             if resp.status_code != 200:
