@@ -49,7 +49,8 @@ def bot_loop():
         "Ev Q2|https://erepublik.tools/en/marketplace/items/0/4/2/offers|0,"
         "Ev Q3|https://erepublik.tools/en/marketplace/items/0/4/3/offers|0,"
         "Ev Q4|https://erepublik.tools/en/marketplace/items/0/4/4/offers|0,"
-        "Ev Q5|https://erepublik.tools/en/marketplace/items/0/4/5/offers|0"
+        "Ev Q5|https://erepublik.tools/en/marketplace/items/0/4/5/offers|0,"
+        "Altin (Gold)|https://erepublik.tools/en/marketplace/monetary-market/gold/offers|1"
     )
     items_raw = os.environ.get("ITEM_WATCH_URLS", DEFAULT_ITEMS)
     ITEM_URLS = {}       # label -> url
