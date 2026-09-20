@@ -45,52 +45,87 @@ def bot_loop():
     ITEM_CHECK_INTERVAL = int(os.environ.get("ITEM_CHECK_INTERVAL_SEC", "600"))  # 10 dakika
     LOOP_TICK = 30  # ana dongu her 30 saniyede bir "sirasi geldi mi" diye bakar
 
-    # --- FIYAT DUSUS ESIGI ---
+    # --- FIYAT DUSUS ESIGI (genel varsayilan - urun bazinda ezilebilir) ---
     PRICE_DROP_PERCENT = float(os.environ.get("PRICE_DROP_PERCENT", "5"))
+
+    # --- MUTLAK "IYI FIYAT" ESIGI (sadece enerji degeri tanimli urunler icin,
+    # su an sadece ekmek). CC/enerji orani bu deger VE ALTINA duserse - onceki
+    # fiyata gore dusus olsun olmasin - ayri bir "IYI FIYAT" bildirimi atilir.
+    # Boylece fiyat hep ayni (dusmeden) iyi kalsa bile kacirilmaz.
+    ABS_VALUE_THRESHOLD = float(os.environ.get("ABS_VALUE_THRESHOLD_CC_PER_ENERGY", "0.40"))
 
     JOB_URL = "https://erepublik.tools/en/marketplace/jobs/0/offers"
 
     # --- TAKIP EDILECEK URUNLER ---
-    # Format: "Etiket1|URL1|MinMiktar1,Etiket2|URL2|MinMiktar2,..."
+    # Format: "Etiket|URL|MinMiktar|DususYuzdesi|Enerji,..."
+    # (DususYuzdesi opsiyonel - verilmezse PRICE_DROP_PERCENT kullanilir.
+    #  Enerji opsiyonel/0 - sadece ekmek gibi enerji karsiligi olan urunlerde
+    #  doldurulur; 0 ise mutlak CC/enerji kontrolu yapilmaz.)
     # MinMiktar: bir ilan bu adetten azsa "en dusuk fiyat" hesabina katilmaz.
     # 0 = miktar filtresi yok (ozellikle Ev gibi az adetli satilan urunler icin).
     # Render'da ITEM_WATCH_URLS environment variable'ini bu formatta
     # tanimlarsaniz asagidaki varsayilanlarin YERINE onlar kullanilir - kod
     # degistirmeden yeni urun eklemek/cikarmak icin bu degiskeni kullanin.
     DEFAULT_ITEMS = (
-        "Ekmek Q1|https://erepublik.tools/en/marketplace/items/0/1/1/offers|500,"
-        "FRM Hammadde|https://erepublik.tools/en/marketplace/items/0/7/1/offers|5,"
-        "WRM Hammadde|https://erepublik.tools/en/marketplace/items/0/12/1/offers|5,"
-        "HRM Hammadde|https://erepublik.tools/en/marketplace/items/0/17/1/offers|5,"
-        "ARM Hammadde|https://erepublik.tools/en/marketplace/items/0/24/1/offers|5,"
-        "Hava Silahi Q5|https://erepublik.tools/en/marketplace/items/0/23/5/offers|5,"
-        "Ev Q1|https://erepublik.tools/en/marketplace/items/0/4/1/offers|0,"
-        "Ev Q2|https://erepublik.tools/en/marketplace/items/0/4/2/offers|0,"
-        "Ev Q3|https://erepublik.tools/en/marketplace/items/0/4/3/offers|0,"
-        "Ev Q4|https://erepublik.tools/en/marketplace/items/0/4/4/offers|0,"
-        "Ev Q5|https://erepublik.tools/en/marketplace/items/0/4/5/offers|0,"
-        "Altin (Gold)|https://erepublik.tools/en/marketplace/monetary-market/gold/offers|1"
+        "Ekmek Q1|https://erepublik.tools/en/marketplace/items/0/1/1/offers|500|10|2,"
+        "Ekmek Q2|https://erepublik.tools/en/marketplace/items/0/1/2/offers|500|5|4,"
+        "Ekmek Q3|https://erepublik.tools/en/marketplace/items/0/1/3/offers|500|5|6,"
+        "Ekmek Q4|https://erepublik.tools/en/marketplace/items/0/1/4/offers|500|5|8,"
+        "Ekmek Q5|https://erepublik.tools/en/marketplace/items/0/1/5/offers|500|10|10,"
+        "Ekmek Q6|https://erepublik.tools/en/marketplace/items/0/1/6/offers|500|10|12,"
+        "Ekmek Q7|https://erepublik.tools/en/marketplace/items/0/1/7/offers|500|10|20,"
+        "FRM Hammadde|https://erepublik.tools/en/marketplace/items/0/7/1/offers|5|5|0,"
+        "WRM Hammadde|https://erepublik.tools/en/marketplace/items/0/12/1/offers|5|5|0,"
+        "HRM Hammadde|https://erepublik.tools/en/marketplace/items/0/17/1/offers|5|5|0,"
+        "ARM Hammadde|https://erepublik.tools/en/marketplace/items/0/24/1/offers|5|5|0,"
+        "Hava Silahi Q5|https://erepublik.tools/en/marketplace/items/0/23/5/offers|5|5|0,"
+        "Silah Q7|https://erepublik.tools/en/marketplace/items/0/2/7/offers|50|10|0,"
+        "Ev Q1|https://erepublik.tools/en/marketplace/items/0/4/1/offers|0|5|0,"
+        "Ev Q2|https://erepublik.tools/en/marketplace/items/0/4/2/offers|0|5|0,"
+        "Ev Q3|https://erepublik.tools/en/marketplace/items/0/4/3/offers|0|5|0,"
+        "Ev Q4|https://erepublik.tools/en/marketplace/items/0/4/4/offers|0|5|0,"
+        "Ev Q5|https://erepublik.tools/en/marketplace/items/0/4/5/offers|0|5|0,"
+        "Altin (Gold)|https://erepublik.tools/en/marketplace/monetary-market/gold/offers|1|5|0"
     )
     items_raw = os.environ.get("ITEM_WATCH_URLS", DEFAULT_ITEMS)
     ITEM_URLS = {}       # label -> url
     ITEM_MIN_QTY = {}    # label -> minimum miktar
+    ITEM_DROP_PCT = {}   # label -> dususte alarm esigi (%)
+    ITEM_ENERGY = {}     # label -> enerji karsiligi (0 = yok, mutlak kontrol atlanir)
+
+    def _add_item(label, url, min_qty, drop_pct, energy):
+        label = label.strip()
+        ITEM_URLS[label] = url.strip()
+        try:
+            ITEM_MIN_QTY[label] = float(min_qty)
+        except (ValueError, TypeError):
+            ITEM_MIN_QTY[label] = 0
+        try:
+            ITEM_DROP_PCT[label] = float(drop_pct)
+        except (ValueError, TypeError):
+            ITEM_DROP_PCT[label] = PRICE_DROP_PERCENT
+        try:
+            ITEM_ENERGY[label] = float(energy)
+        except (ValueError, TypeError):
+            ITEM_ENERGY[label] = 0
+
     for entry in items_raw.split(","):
         entry = entry.strip()
         if not entry:
             continue
         parts = entry.split("|")
-        if len(parts) == 3:
+        if len(parts) == 5:
+            _add_item(*parts)
+        elif len(parts) == 4:
+            label, url, min_qty, drop_pct = parts
+            _add_item(label, url, min_qty, drop_pct, 0)
+        elif len(parts) == 3:
             label, url, min_qty = parts
-            ITEM_URLS[label.strip()] = url.strip()
-            try:
-                ITEM_MIN_QTY[label.strip()] = float(min_qty.strip())
-            except ValueError:
-                ITEM_MIN_QTY[label.strip()] = 0
+            _add_item(label, url, min_qty, PRICE_DROP_PERCENT, 0)
         elif len(parts) == 1 and "=" in parts[0]:
-            # Eski format (Etiket=URL) ile geriye donuk uyumluluk - min miktar 0 kabul edilir
+            # Eski format (Etiket=URL) ile geriye donuk uyumluluk
             label, url = parts[0].split("=", 1)
-            ITEM_URLS[label.strip()] = url.strip()
-            ITEM_MIN_QTY[label.strip()] = 0
+            _add_item(label, url, 0, PRICE_DROP_PERCENT, 0)
 
     HDR = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -194,11 +229,13 @@ def bot_loop():
 
     # ---------------- URUN FIYATLARI ----------------
     last_lowest_price = {}  # label -> fiyat
+    good_value_state = {}   # label -> su an "iyi fiyat" esigi altinda mi (spam onlemek icin)
 
     def check_items():
         for label, url in ITEM_URLS.items():
             try:
                 min_qty = ITEM_MIN_QTY.get(label, 0)
+                drop_pct_threshold = ITEM_DROP_PCT.get(label, PRICE_DROP_PERCENT)
                 rows = fetch_table_rows(url)
                 if DEBUG:
                     print(f"[TANI] {label} - satir sayisi: {len(rows)}, min miktar: {min_qty}")
@@ -230,7 +267,7 @@ def bot_loop():
 
                 if label in last_lowest_price:
                     baseline = last_lowest_price[label]
-                    threshold_price = baseline * (1 - PRICE_DROP_PERCENT / 100)
+                    threshold_price = baseline * (1 - drop_pct_threshold / 100)
                     if baseline > 0 and price <= threshold_price:
                         drop_pct = (1 - price / baseline) * 100
                         msg = (f"FIYAT DUSTU: {label}\n"
@@ -241,6 +278,23 @@ def bot_loop():
                         print(f"FIYAT ALARMI GONDERILDI: {label} -> {price}")
 
                 last_lowest_price[label] = price
+
+                # --- MUTLAK "IYI FIYAT" KONTROLU (sadece enerji degeri tanimli urunlerde) ---
+                energy = ITEM_ENERGY.get(label, 0)
+                if energy > 0:
+                    value_ratio = price / energy
+                    was_good = good_value_state.get(label, False)
+                    is_good = value_ratio <= ABS_VALUE_THRESHOLD
+
+                    if is_good and not was_good:
+                        msg = (f"IYI FIYAT: {label}\n"
+                               f"Fiyat: {price:.2f} | Enerji: {energy:.0f} | "
+                               f"Oran: {value_ratio:.3f} CC/enerji (esik: {ABS_VALUE_THRESHOLD:.2f})\n"
+                               f"Link: {link}")
+                        send_tg(msg)
+                        print(f"IYI FIYAT ALARMI GONDERILDI: {label} -> {value_ratio:.3f}")
+
+                    good_value_state[label] = is_good
             except Exception as e:
                 print(f"{label} kontrol hatasi: {e}")
 
@@ -250,6 +304,8 @@ def bot_loop():
 
     last_job_check = 0
     last_item_check = 0
+    last_error_alert_time = 0
+    ERROR_ALERT_COOLDOWN = 1800  # ayni hata tekrar tekrar spam atmasin diye en az 30dk ara
 
     while True:
         try:
@@ -266,6 +322,10 @@ def bot_loop():
             time.sleep(LOOP_TICK)
         except Exception as e:
             print(f"Ana dongu hatasi: {e}")
+            now = time.time()
+            if now - last_error_alert_time > ERROR_ALERT_COOLDOWN:
+                send_tg(f"MARKET WATCHER HATA!\nAna dongude beklenmeyen hata: {e}\nBot calismaya devam ediyor ama kontrol etmek isteyebilirsiniz.")
+                last_error_alert_time = now
             time.sleep(30)
 
 
