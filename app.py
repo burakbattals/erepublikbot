@@ -3,10 +3,15 @@ import threading
 import requests
 import os
 import re
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 from bs4 import BeautifulSoup
 
 app = Flask(__name__)
+
+# --- TELEGRAM (modul seviyesinde - hem bot_loop hem Flask route'lari kullanabilsin) ---
+TG_TOKEN = os.environ.get("TG_TOKEN", "BURAYA_TOKEN_KOYUN")
+TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "BURAYA_CHAT_ID_KOYUN")
+TG_URL = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
 
 # Tampermonkey scripti (tarayici tarafi) bu listeyi periyodik cekip kendi
 # panelinde gosterebilsin diye son bildirimleri hafizada tutuyoruz. Thread-safe
@@ -22,6 +27,88 @@ def _record_alert(text):
         del _recent_alerts[MAX_RECENT_ALERTS:]
 
 
+def send_tg(text):
+    """Modul seviyesinde - hem bot_loop() hem Flask route handler'lari
+    (energy-report gibi) buradan Telegram'a mesaj atabilir."""
+    _record_alert(text)
+    try:
+        resp = requests.post(TG_URL, json={"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "Markdown"}, timeout=10)
+        if resp.status_code != 200:
+            print(f"Telegram gonderim hatasi: {resp.status_code} {resp.text[:200]}")
+    except Exception as e:
+        print(f"Telegram gonderim istisnasi: {e}")
+
+
+# ============ RW PAYLASILAN DURUM (cihaz/tarayici bagimsiz) ============
+# RW takibi (gecmis, bildirilenler, ilk kurulum bayragi) artik burada - Render
+# sunucusunda - tutuluyor, tarayicinin kendi hafizasinda degil. Boylece PC'den
+# de telefondan da acilsa, hangi cihaz olursa olsun AYNI veriyi okur/yazar.
+# Kilit de burada, gercek bir threading.Lock ile ATOMIK - tarayici tarafinda
+# yasadigimiz "iki taraf da ayni anda kilidi aldi" yarisi burada olusmaz.
+_rw_state = {"alerted": {}, "history": {}, "bootstrapped": False}
+_rw_state_lock = threading.Lock()
+_rw_scan_lock = {"owner": None, "ts": 0}
+_rw_scan_lock_guard = threading.Lock()
+RW_LOCK_STALE_SECONDS = 90
+
+
+@app.route('/rw-state', methods=['GET'])
+def get_rw_state():
+    with _rw_state_lock:
+        return jsonify(_rw_state)
+
+
+@app.route('/rw-state', methods=['POST'])
+def set_rw_state():
+    body = request.get_json(force=True, silent=True) or {}
+    with _rw_state_lock:
+        if "alerted" in body:
+            _rw_state["alerted"] = body["alerted"]
+        if "history" in body:
+            _rw_state["history"] = body["history"]
+        if "bootstrapped" in body:
+            _rw_state["bootstrapped"] = body["bootstrapped"]
+    return jsonify({"ok": True})
+
+
+@app.route('/rw-lock/acquire', methods=['POST'])
+def acquire_rw_lock():
+    body = request.get_json(force=True, silent=True) or {}
+    owner = body.get("owner")
+    if not owner:
+        return jsonify({"acquired": False, "error": "owner gerekli"}), 400
+
+    now = time.time()
+    with _rw_scan_lock_guard:
+        free = (_rw_scan_lock["owner"] is None) or (now - _rw_scan_lock["ts"] > RW_LOCK_STALE_SECONDS)
+        if free:
+            _rw_scan_lock["owner"] = owner
+            _rw_scan_lock["ts"] = now
+            return jsonify({"acquired": True})
+        return jsonify({"acquired": False})
+
+
+@app.route('/rw-lock/refresh', methods=['POST'])
+def refresh_rw_lock():
+    body = request.get_json(force=True, silent=True) or {}
+    owner = body.get("owner")
+    with _rw_scan_lock_guard:
+        if _rw_scan_lock["owner"] == owner:
+            _rw_scan_lock["ts"] = time.time()
+            return jsonify({"ok": True})
+        return jsonify({"ok": False})
+
+
+@app.route('/rw-lock/release', methods=['POST'])
+def release_rw_lock():
+    body = request.get_json(force=True, silent=True) or {}
+    owner = body.get("owner")
+    with _rw_scan_lock_guard:
+        if _rw_scan_lock["owner"] == owner:
+            _rw_scan_lock["owner"] = None
+    return jsonify({"ok": True})
+
+
 @app.route('/')
 def home():
     return "erepublik.tools Market Watcher Bot Aktif!"
@@ -33,11 +120,62 @@ def recent_alerts():
         return jsonify(list(_recent_alerts))
 
 
-def bot_loop():
-    TOKEN = os.environ.get("TG_TOKEN", "BURAYA_TOKEN_KOYUN")
-    CHAT_ID = os.environ.get("TG_CHAT_ID", "BURAYA_CHAT_ID_KOYUN")
-    TG = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+# ============ ENERJI TAHMINI (cihaz/tarayici bagimsiz) ============
+# Tarayici (Tampermonkey) her enerji okumasini buraya bildirir. Buradan
+# dolum hizi (rate) hesaplanip "tahmini dolma zamani" saklaniyor. Ayrica
+# bot_loop'un kendi dongusu bu zamani surekli kontrol ediyor - boylece
+# TARAYICI KAPALI OLSA BILE, tahmin edilen an gelince Telegram'a mesaj gider.
+_energy_state = {
+    "current": None, "limit": None, "rate_per_min": None,
+    "projected_full_at": None, "notified": True, "last_update": 0,
+}
+_energy_lock = threading.Lock()
 
+
+@app.route('/energy-report', methods=['POST'])
+def energy_report():
+    body = request.get_json(force=True, silent=True) or {}
+    current = body.get("current")
+    limit = body.get("limit")
+    if current is None or limit is None:
+        return jsonify({"ok": False}), 400
+
+    now = time.time()
+    with _energy_lock:
+        prev = _energy_state
+        # Enerji dustuyse (harcanmissa) yeni bir dolum donemi basliyor demektir.
+        if prev["current"] is not None and current < prev["current"]:
+            _energy_state["notified"] = False
+
+        # Iki ardisik okuma arasinda enerji arttiysa (harcama olmadan), gercek
+        # dolum hizini buradan cikarabiliriz.
+        if prev["current"] is not None and prev["last_update"] and current >= prev["current"]:
+            dt_min = (now - prev["last_update"]) / 60.0
+            d_energy = current - prev["current"]
+            if dt_min > 0.5 and d_energy > 0:
+                _energy_state["rate_per_min"] = d_energy / dt_min
+
+        _energy_state["current"] = current
+        _energy_state["limit"] = limit
+        _energy_state["last_update"] = now
+
+        if current >= limit:
+            if not _energy_state["notified"]:
+                send_tg(f"ENERJI DOLDU! {int(current)}/{int(limit)}")
+                _energy_state["notified"] = True
+            _energy_state["projected_full_at"] = now
+        else:
+            rate = _energy_state.get("rate_per_min")
+            if rate and rate > 0:
+                remaining = limit - current
+                _energy_state["projected_full_at"] = now + (remaining / rate) * 60
+            else:
+                _energy_state["projected_full_at"] = None
+
+    return jsonify({"ok": True})
+
+
+def bot_loop():
     DEBUG = os.environ.get("DEBUG", "0") == "1"
 
     # --- ZAMANLAMA (Render Environment'tan degistirilebilir) ---
@@ -84,8 +222,8 @@ def bot_loop():
         "Ev Q1|https://erepublik.tools/en/marketplace/items/0/4/1/offers|0|5|0,"
         "Ev Q2|https://erepublik.tools/en/marketplace/items/0/4/2/offers|0|5|0,"
         "Ev Q3|https://erepublik.tools/en/marketplace/items/0/4/3/offers|0|5|0,"
-        "Ev Q4|https://erepublik.tools/en/marketplace/items/0/4/4/offers|0|5|0,"
-        "Ev Q5|https://erepublik.tools/en/marketplace/items/0/4/5/offers|0|5|0,"
+        "Ev Q4|https://erepublik.tools/en/marketplace/items/0/4/4/offers|0|15|0,"
+        "Ev Q5|https://erepublik.tools/en/marketplace/items/0/4/5/offers|0|15|0,"
         "Altin (Gold)|https://erepublik.tools/en/marketplace/monetary-market/gold/offers|1|5|0"
     )
     items_raw = os.environ.get("ITEM_WATCH_URLS", DEFAULT_ITEMS)
@@ -133,15 +271,6 @@ def bot_loop():
                       "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7",
     }
-
-    def send_tg(text):
-        _record_alert(text)
-        try:
-            resp = requests.post(TG, json={"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"}, timeout=10)
-            if resp.status_code != 200:
-                print(f"Telegram gonderim hatasi: {resp.status_code} {resp.text[:200]}")
-        except Exception as e:
-            print(f"Telegram gonderim istisnasi: {e}")
 
     def parse_number(text):
         """'7,524.00' gibi metinleri float'a cevirir."""
@@ -273,7 +402,7 @@ def bot_loop():
                         drop_pct = (1 - price / baseline) * 100
                         msg = (f"FIYAT DUSTU: {label}\n"
                                f"Onceki en dusuk: {baseline:.2f}\n"
-                               f"Yeni en dusuk: {price:.2f} (%{drop_pct:.1f} dusus)\n"
+                               f"Yeni en dusuk: {price:.2f} (%{drop_pct:.1f} dusus, esik: %{drop_pct_threshold:.0f})\n"
                                f"Link: {link}")
                         send_tg(msg)
                         print(f"FIYAT ALARMI GONDERILDI: {label} -> {price}")
@@ -308,6 +437,13 @@ def bot_loop():
     last_error_alert_time = 0
     ERROR_ALERT_COOLDOWN = 1800  # ayni hata tekrar tekrar spam atmasin diye en az 30dk ara
 
+    # --- ALTIN SABAH HATIRLATICISI ---
+    # Turkiye saatiyle (UTC+3, DST yok) 09:45 ve 10:01'de "10 gold al" hatirlatmasi.
+    # Render sunucusu UTC calisir, o yuzden hedef saatleri UTC'ye ceviriyoruz:
+    # 09:45 TR = 06:45 UTC, 10:01 TR = 07:01 UTC.
+    GOLD_REMINDER_TIMES_UTC = [(6, 45), (7, 1)]
+    last_gold_reminder_date = {t: None for t in GOLD_REMINDER_TIMES_UTC}
+
     while True:
         try:
             now = time.time()
@@ -319,6 +455,22 @@ def bot_loop():
             if now - last_item_check >= ITEM_CHECK_INTERVAL:
                 check_items()
                 last_item_check = now
+
+            # --- Enerji tahmini: dolma zamani geldiyse (tarayici acik olmasa bile) ---
+            with _energy_lock:
+                proj = _energy_state.get("projected_full_at")
+                if proj and not _energy_state.get("notified") and now >= proj:
+                    limit = _energy_state.get("limit")
+                    send_tg(f"ENERJI DOLDU (tahmini)! ~{int(limit) if limit else '?'} enerji")
+                    _energy_state["notified"] = True
+
+            # --- Altin sabah hatirlaticisi ---
+            nowutc = time.gmtime(now)
+            today_str = time.strftime("%Y-%m-%d", nowutc)
+            for (hh, mm) in GOLD_REMINDER_TIMES_UTC:
+                if nowutc.tm_hour == hh and nowutc.tm_min == mm and last_gold_reminder_date[(hh, mm)] != today_str:
+                    send_tg("ALTIN HATIRLATICI\nSabah saatleri genelde daha ucuz oluyor - 10 gold almayi unutma!")
+                    last_gold_reminder_date[(hh, mm)] = today_str
 
             time.sleep(LOOP_TICK)
         except Exception as e:
