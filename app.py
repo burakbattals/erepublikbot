@@ -142,35 +142,44 @@ def energy_report():
 
     now = time.time()
     with _energy_lock:
-        prev = _energy_state
-        # Enerji dustuyse (harcanmissa) yeni bir dolum donemi basliyor demektir.
-        if prev["current"] is not None and current < prev["current"]:
-            _energy_state["notified"] = False
+        st = _energy_state
+        pc, pl = st["current"], st["limit"]
+        changed = (pc is None) or (current != pc) or (limit != pl)
 
-        # Iki ardisik okuma arasinda enerji arttiysa (harcama olmadan), gercek
-        # dolum hizini buradan cikarabiliriz.
-        if prev["current"] is not None and prev["last_update"] and current >= prev["current"]:
-            dt_min = (now - prev["last_update"]) / 60.0
-            d_energy = current - prev["current"]
+        # Sayfa yenilenmediyse DOM ayni degeri gosterir (bayat okuma). Bu durumda
+        # hicbir sey guncellenmez; projeksiyon sabit kalir ve zamani gelince dolar.
+        if not changed:
+            st["last_update"] = now
+            return jsonify({"ok": True, "stale": True})
+
+        # Enerji dustuyse (harcanmissa) yeni dolum donemi
+        if pc is not None and current < pc:
+            st["notified"] = False
+        # Artis: hizi, degerin en son DEGISTIGI andan itibaren hesapla
+        elif pc is not None and st.get("changed_at"):
+            dt_min = (now - st["changed_at"]) / 60.0
+            d_energy = current - pc
             if dt_min > 0.5 and d_energy > 0:
-                _energy_state["rate_per_min"] = d_energy / dt_min
+                st["rate_per_min"] = d_energy / dt_min
 
-        _energy_state["current"] = current
-        _energy_state["limit"] = limit
-        _energy_state["last_update"] = now
+        st["current"], st["limit"] = current, limit
+        st["last_update"] = now
+        st["changed_at"] = now
 
         if current >= limit:
-            if not _energy_state["notified"]:
+            if not st["notified"]:
                 send_tg(f"ENERJI DOLDU! {int(current)}/{int(limit)}")
-                _energy_state["notified"] = True
-            _energy_state["projected_full_at"] = now
+                st["notified"] = True
+            st["projected_full_at"] = now
         else:
-            rate = _energy_state.get("rate_per_min")
+            rate = st.get("rate_per_min")
             if rate and rate > 0:
-                remaining = limit - current
-                _energy_state["projected_full_at"] = now + (remaining / rate) * 60
+                st["projected_full_at"] = now + ((limit - current) / rate) * 60
+                # Tahmin gelecekteyse tekrar bildirime hazir ol
+                if current > (pc or 0):
+                    st["notified"] = False
             else:
-                _energy_state["projected_full_at"] = None
+                st["projected_full_at"] = None
 
     return jsonify({"ok": True})
 
