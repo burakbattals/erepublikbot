@@ -13,6 +13,345 @@ TG_TOKEN = os.environ.get("TG_TOKEN", "BURAYA_TOKEN_KOYUN")
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "BURAYA_CHAT_ID_KOYUN")
 TG_URL = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
 
+# --- GECE MODU (Filipinler hava enerji botu) ---
+ERE_COOKIE = os.environ.get("ERE_COOKIE", "")
+API_SECRET = os.environ.get("API_SECRET", "")
+ERE_BASE_URL = "https://www.erepublik.com"
+NIGHT_CHECK_INTERVAL_SEC = int(os.environ.get("NIGHT_CHECK_INTERVAL_SEC", "60"))
+
+DEFENDER_MAX_ENERGY_PER_HIT = 4000
+INVADER_DAMAGE_PER_ENERGY = 14.08
+INVADER_NO_OPPONENT_MAX_ENERGY = 2000
+INVADER_NO_OPPONENT_MAX_DAMAGE = 25000
+
+# Aktif saat penceresi, gun bazli. weekday(): Pazartesi=0 ... Pazar=6, Sali=1.
+DAILY_ACTIVE_WINDOWS = {1: (0, 6)}  # Sali: 00:00-06:00
+DEFAULT_ACTIVE_WINDOW = (0, 8)      # Diger gunler: 00:00-08:00
+
+# Gece modu SADECE elle (Tampermonkey panelindeki "Gece Modu" dugmesiyle)
+# ACTIVE yapilirsa VE saat penceresi icindeyse calisir. Kapatilirsa ya da
+# pencere disindaysa hicbir tarama/vurus yapmaz. Kasitli olarak process
+# hafizasinda tutuluyor - sunucu yeniden baslarsa varsayilan KAPALI olur,
+# yanlislikla "unutulmus acik" gece modu calismaz.
+_night_mode = {"manual_enabled": False, "enabled_at": None}
+_night_mode_lock = threading.Lock()
+
+# Cerez geçersiz hale gelince (CSRF token alinamayinca) gece botu TAMAMEN
+# durur, cerez degistirilip deploy edilene kadar tekrar denemez.
+_night_halt = {"halted": False, "reason": None}
+_night_halt_lock = threading.Lock()
+
+# Round basina harcanan enerji (round_key -> spent)
+_night_round_spent = {}
+_night_round_spent_lock = threading.Lock()
+
+
+def _cookie_fingerprint():
+    import hashlib
+    return hashlib.sha256(ERE_COOKIE.encode("utf-8")).hexdigest()[:16]
+
+
+def night_set_halted(reason):
+    with _night_halt_lock:
+        _night_halt["halted"] = True
+        _night_halt["reason"] = reason
+        _night_halt["cookie_fingerprint"] = _cookie_fingerprint()
+
+
+def night_is_halted():
+    with _night_halt_lock:
+        if not _night_halt["halted"]:
+            return False
+        if _night_halt.get("cookie_fingerprint") != _cookie_fingerprint():
+            # Cerez degisti (yeni deploy) - otomatik temizle.
+            _night_halt["halted"] = False
+            _night_halt["reason"] = None
+            return False
+        return True
+
+
+def night_round_key(battle_id, battle_zone_id):
+    return f"{battle_id}:{battle_zone_id}"
+
+
+def night_get_round_spent(battle_id, battle_zone_id):
+    with _night_round_spent_lock:
+        return _night_round_spent.get(night_round_key(battle_id, battle_zone_id), 0)
+
+
+def night_add_round_spent(battle_id, battle_zone_id, amount):
+    with _night_round_spent_lock:
+        key = night_round_key(battle_id, battle_zone_id)
+        _night_round_spent[key] = _night_round_spent.get(key, 0) + amount
+        return _night_round_spent[key]
+
+
+def night_is_within_active_window():
+    import datetime as _dt
+    try:
+        from zoneinfo import ZoneInfo
+        now = _dt.datetime.now(ZoneInfo("Europe/Istanbul"))
+    except Exception:
+        now = _dt.datetime.utcnow() + _dt.timedelta(hours=3)  # yedek: TR = UTC+3
+    start_hour, end_hour = DAILY_ACTIVE_WINDOWS.get(now.weekday(), DEFAULT_ACTIVE_WINDOW)
+    hour = now.hour
+    if start_hour <= end_hour:
+        return start_hour <= hour < end_hour
+    return hour >= start_hour or hour < end_hour
+
+
+def night_mode_is_running():
+    """Su an gercekten tarama/vurus yapiyor mu? (elle acik + saat penceresi + halted degil)"""
+    with _night_mode_lock:
+        manual = _night_mode["manual_enabled"]
+    return manual and night_is_within_active_window() and not night_is_halted()
+
+
+def _check_api_secret():
+    if not API_SECRET:
+        return False
+    key = request.headers.get("X-Api-Key") or request.args.get("key")
+    return key == API_SECRET
+
+
+@app.route('/gece-modu', methods=['GET'])
+def gece_modu_get():
+    if not _check_api_secret():
+        return jsonify({"error": "unauthorized"}), 401
+    with _night_mode_lock:
+        manual = _night_mode["manual_enabled"]
+        enabled_at = _night_mode["enabled_at"]
+    return jsonify({
+        "manual_enabled": manual,
+        "enabled_at": enabled_at,
+        "within_time_window": night_is_within_active_window(),
+        "halted": night_is_halted(),
+        "halt_reason": _night_halt.get("reason"),
+        "actually_running": night_mode_is_running(),
+    })
+
+
+@app.route('/gece-modu', methods=['POST'])
+def gece_modu_set():
+    if not _check_api_secret():
+        return jsonify({"error": "unauthorized"}), 401
+    body = request.get_json(force=True, silent=True) or {}
+    enabled = bool(body.get("enabled"))
+    with _night_mode_lock:
+        _night_mode["manual_enabled"] = enabled
+        _night_mode["enabled_at"] = time.time() if enabled else None
+    send_tg(f"Gece Modu {'AKTIF edildi' if enabled else 'PASIF edildi'} (panelden).")
+    return jsonify({"ok": True, "manual_enabled": enabled, "actually_running": night_mode_is_running()})
+
+
+def _ere_session():
+    s = requests.Session()
+    if ERE_COOKIE:
+        s.headers.update({"Cookie": ERE_COOKIE})
+    s.headers.update({"User-Agent": "Mozilla/5.0"})
+    return s
+
+
+def _night_get_csrf_token(session):
+    resp = session.get(f"{ERE_BASE_URL}/en", timeout=15)
+    resp.raise_for_status()
+    match = re.search(r'csrfToken\s*[:=]\s*[\'"]([a-zA-Z0-9\-_]+)[\'"]', resp.text)
+    if not match:
+        match = re.search(r'name="csrf-token"\s+content="([^"]+)"', resp.text)
+    return match.group(1) if match else None
+
+
+def _night_get_campaigns(session):
+    resp = session.get(f"{ERE_BASE_URL}/en/military/campaigns-new", timeout=15)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _night_get_pool_energy(session, battle_id, side_country_id):
+    resp = session.get(
+        f"{ERE_BASE_URL}/en/military/battlefield-choose-side-new/{battle_id}/{side_country_id}",
+        timeout=15,
+    )
+    if not resp.ok:
+        return None
+    try:
+        data = resp.json()
+        val = data.get("inventory", {}).get("poolEnergy")
+        return float(val) if val is not None else None
+    except Exception:
+        return None
+
+
+def _night_get_battle_statistics(session, token, battle_id, zone_id, battle_zone_id):
+    body = {
+        "battleId": battle_id, "zoneId": zone_id, "action": "battleStatistics",
+        "round": zone_id, "division": 11, "battleZoneId": battle_zone_id,
+        "type": "damage", "leftPage": 1, "rightPage": 1, "_token": token,
+    }
+    resp = session.post(
+        f"{ERE_BASE_URL}/en/military/battle-console", data=body,
+        headers={"X-Requested-With": "XMLHttpRequest"}, timeout=15,
+    )
+    if not resp.ok:
+        return None
+    return resp.json()
+
+
+def _night_find_total_air_damage(side_stats):
+    if not side_stats:
+        return None
+    for key in ("totalDamage", "airDamage", "damage"):
+        if key in side_stats:
+            try:
+                return float(side_stats[key])
+            except (TypeError, ValueError):
+                pass
+    return None
+
+
+def _night_start_deploy(session, token, battle_id, battle_zone_id, side_country_id, total_energy):
+    body = {
+        "_token": token, "battleId": str(battle_id), "battleZoneId": str(battle_zone_id),
+        "sideCountryId": str(side_country_id), "weaponQuality": "-1",
+        "totalEnergy": str(int(total_energy)), "skinId": "18",
+    }
+    resp = session.post(
+        f"{ERE_BASE_URL}/en/military/fightDeploy-startDeploy", data=body,
+        headers={"X-Requested-With": "XMLHttpRequest"}, timeout=15,
+    )
+    if not resp.ok:
+        return {"ok": False, "reason": f"HTTP {resp.status_code}"}
+    try:
+        result = resp.json()
+    except Exception:
+        return {"ok": False, "reason": "Deploy yaniti JSON degil."}
+    if result.get("error"):
+        return {"ok": False, "reason": result.get("message") or result.get("error")}
+    return {"ok": True}
+
+
+def _night_play_energy_rule(opportunity, current_energy, round_spent_so_far):
+    if current_energy is None or current_energy <= 0:
+        return {"ok": False, "reason": "Kullanilabilir enerji yok."}
+
+    if opportunity["philippines_is_defender"]:
+        spent = round_spent_so_far or 0
+        remaining = DEFENDER_MAX_ENERGY_PER_HIT - spent
+        if remaining <= 0:
+            return {"ok": False, "reason": "Savunma enerji sinirina ulasildi."}
+        min_required = 200 if spent > 0 else 3000
+        if current_energy < min_required:
+            return {"ok": False, "reason": "Savunma: enerji esigine ulasilmadi."}
+        return {"ok": True, "amount": min(current_energy, remaining)}
+
+    if opportunity["philippines_is_invader"]:
+        if not opportunity["opponent_has_hit"]:
+            spent = round_spent_so_far or 0
+            est_damage_so_far = spent * INVADER_DAMAGE_PER_ENERGY
+            remaining_energy_cap = INVADER_NO_OPPONENT_MAX_ENERGY - spent
+            remaining_damage_cap = INVADER_NO_OPPONENT_MAX_DAMAGE - est_damage_so_far
+            if remaining_energy_cap <= 0 or remaining_damage_cap <= 0:
+                return {"ok": False, "reason": "Karsida kimse yok: round sinirina ulasildi."}
+            min_required = 200 if spent > 0 else 1500
+            if current_energy < min_required:
+                return {"ok": False, "reason": "Karsida kimse yok: enerji esigine ulasilmadi."}
+            remaining_energy_for_damage_cap = max(0, int(remaining_damage_cap // INVADER_DAMAGE_PER_ENERGY))
+            amount = min(current_energy, remaining_energy_cap, remaining_energy_for_damage_cap)
+            if amount <= 0:
+                return {"ok": False, "reason": "Karsida kimse yok: hasar sinirina ulasildi."}
+            return {"ok": True, "amount": amount}
+
+        required_our_damage = (opportunity["opponent_total_damage"] or 0) / 2
+        needed_damage = max(0, required_our_damage - (opportunity["philippines_total_damage"] or 0))
+        if needed_damage <= 0:
+            return {"ok": False, "reason": "Hedef hasara zaten ulasildi."}
+        needed_energy = int(-(-needed_damage // INVADER_DAMAGE_PER_ENERGY))
+        if current_energy < 200:
+            return {"ok": False, "reason": "Tamamlama icin en az 200 enerji bekleniyor."}
+        return {"ok": True, "amount": min(current_energy, needed_energy)}
+
+    return {"ok": False, "reason": "Filipinler tarafi belirlenemedi."}
+
+
+def _night_find_opportunities(campaigns):
+    countries = campaigns.get("countries", {})
+    battles = campaigns.get("battles", {})
+    opportunities = []
+    for battle_id, battle in battles.items():
+        inv_id = battle.get("inv", {}).get("id")
+        def_id = battle.get("def", {}).get("id")
+        inv_name = countries.get(str(inv_id), {}).get("name", "")
+        def_name = countries.get(str(def_id), {}).get("name", "")
+        is_invader = bool(re.search(r"philippines|filipinler", inv_name, re.I))
+        is_defender = bool(re.search(r"philippines|filipinler", def_name, re.I))
+        if not is_invader and not is_defender:
+            continue
+        for zone_id, division in (battle.get("div") or {}).items():
+            if int(division.get("div", -1)) == 11 and not division.get("division_end"):
+                opportunities.append({
+                    "battle_id": battle_id, "battle_zone_id": zone_id, "zone_id": battle.get("zone_id"),
+                    "inv_id": inv_id, "def_id": def_id,
+                    "philippines_is_invader": is_invader, "philippines_is_defender": is_defender,
+                })
+    return opportunities
+
+
+def _night_enrich(session, token, opp):
+    stats = _night_get_battle_statistics(session, token, opp["battle_id"], opp["zone_id"], opp["battle_zone_id"])
+    if not stats or stats.get("error"):
+        return None
+    philippines_id = opp["inv_id"] if opp["philippines_is_invader"] else opp["def_id"]
+    opponent_id = opp["def_id"] if opp["philippines_is_invader"] else opp["inv_id"]
+    opponent_fighters = (stats.get(str(opponent_id)) or {}).get("fighterData", {})
+    opp["opponent_has_hit"] = len(opponent_fighters) > 0
+    opp["philippines_total_damage"] = _night_find_total_air_damage(stats.get(str(philippines_id)))
+    opp["opponent_total_damage"] = _night_find_total_air_damage(stats.get(str(opponent_id)))
+    return opp
+
+
+def run_night_check_once():
+    if not ERE_COOKIE:
+        return
+    session = _ere_session()
+    try:
+        token = _night_get_csrf_token(session)
+        if not token:
+            night_set_halted("CSRF token alinamadi - cerez suresi dolmus olabilir.")
+            send_tg("GECE MODU DURDURULDU: cerez gecersiz gorunuyor. ERE_COOKIE'yi guncelleyip "
+                     "deploy edene kadar hicbir sey yapmayacagim.")
+            return
+
+        campaigns = _night_get_campaigns(session)
+        for opp in _night_find_opportunities(campaigns):
+            enriched = _night_enrich(session, token, opp)
+            if not enriched:
+                continue
+            side_country_id = enriched["inv_id"] if enriched["philippines_is_invader"] else enriched["def_id"]
+            current_energy = _night_get_pool_energy(session, enriched["battle_id"], side_country_id)
+            round_spent = night_get_round_spent(enriched["battle_id"], enriched["battle_zone_id"])
+
+            rule = _night_play_energy_rule(enriched, current_energy, round_spent)
+            if not rule["ok"]:
+                continue
+
+            deploy = _night_start_deploy(
+                session, token, enriched["battle_id"], enriched["battle_zone_id"], side_country_id, rule["amount"]
+            )
+            if not deploy["ok"]:
+                continue
+
+            new_total = night_add_round_spent(enriched["battle_id"], enriched["battle_zone_id"], rule["amount"])
+            send_tg(
+                "*Gece Modu - vurus yapildi*\n"
+                f"Savas: {enriched['battle_id']} (round {enriched['battle_zone_id']})\n"
+                f"Bu vurusta harcanan enerji: {int(rule['amount'])}\n"
+                f"Bu round'da toplam harcanan: {int(new_total)}"
+            )
+    except Exception as exc:
+        send_tg(f"Gece Modu hata verdi: {exc}")
+
+
+
 # Tampermonkey scripti (tarayici tarafi) bu listeyi periyodik cekip kendi
 # panelinde gosterebilsin diye son bildirimleri hafizada tutuyoruz. Thread-safe
 # olmasi icin basit bir kilit kullaniyoruz.
@@ -118,6 +457,25 @@ def home():
 def recent_alerts():
     with _recent_alerts_lock:
         return jsonify(list(_recent_alerts))
+
+
+@app.route('/status')
+def night_status():
+    if not _check_api_secret():
+        return jsonify({"error": "unauthorized"}), 401
+    with _night_round_spent_lock:
+        round_state = dict(_night_round_spent)
+    return jsonify({
+        "gece_modu": {
+            "manual_enabled": _night_mode["manual_enabled"],
+            "within_time_window": night_is_within_active_window(),
+            "halted": night_is_halted(),
+            "halt_reason": _night_halt.get("reason"),
+            "actually_running": night_mode_is_running(),
+            "round_state": round_state,
+        },
+        "energy_state": _energy_state,
+    })
 
 
 # ============ ENERJI TAHMINI (cihaz/tarayici bagimsiz) ============
@@ -445,6 +803,7 @@ def bot_loop():
     last_item_check = 0
     last_error_alert_time = 0
     ERROR_ALERT_COOLDOWN = 1800  # ayni hata tekrar tekrar spam atmasin diye en az 30dk ara
+    last_night_check = 0
 
     # --- ALTIN SABAH HATIRLATICISI ---
     # Turkiye saatiyle (UTC+3, DST yok) 09:45 ve 10:01'de "10 gold al" hatirlatmasi.
@@ -457,7 +816,17 @@ def bot_loop():
         try:
             now = time.time()
 
-            if now - last_job_check >= JOB_CHECK_INTERVAL:
+            # --- Gece Modu: elle acik + saat penceresi icinde + halted degilse
+            # havada Filipinler taramasi/vurusu yap. Bu calisirken yogunlugu
+            # artirmamak icin Is Ilanlari taramasi (Piyasa ve RW disinda kalan
+            # tarama) duraklatilir; Piyasa (check_items) ve RW (client-driven
+            # /rw-state) normal calismaya devam eder.
+            gece_aktif = night_mode_is_running()
+            if gece_aktif and now - last_night_check >= NIGHT_CHECK_INTERVAL_SEC:
+                run_night_check_once()
+                last_night_check = now
+
+            if now - last_job_check >= JOB_CHECK_INTERVAL and not gece_aktif:
                 check_jobs()
                 last_job_check = now
 
