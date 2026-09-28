@@ -8,6 +8,59 @@ from bs4 import BeautifulSoup
 
 app = Flask(__name__)
 
+# --- ROUND KİLİDİ ÖNBELLEĞİ (Render, 3 saat) ---
+# Cihaz/tarayıcı tamamen kapansa/değişse bile hangi round'a kilitlendiğimizi
+# hatırlamak için basit bir sunucu tarafı önbellek. Render'ın ücretsiz planı
+# ara sıra yeniden başlayabildiği için (bellek sıfırlanır) bu, cihazdaki
+# GM storage'ın YERİNE değil, YANINDA bir yedek olarak çalışır.
+API_SECRET = os.environ.get("API_SECRET", "")
+ROUND_LOCK_TTL_SECONDS = 3 * 3600
+_round_lock = {"battleId": None, "battleZoneId": None, "updatedAt": 0}
+_round_lock_lock = threading.Lock()
+
+
+def _check_api_secret():
+    if not API_SECRET:
+        return False
+    key = request.headers.get("X-Api-Key") or request.args.get("key")
+    return key == API_SECRET
+
+
+@app.route('/round-lock', methods=['GET'])
+def round_lock_get():
+    if not _check_api_secret():
+        return jsonify({"error": "unauthorized"}), 401
+    with _round_lock_lock:
+        age = time.time() - _round_lock["updatedAt"]
+        if _round_lock["battleId"] and age <= ROUND_LOCK_TTL_SECONDS:
+            return jsonify({
+                "battleId": _round_lock["battleId"],
+                "battleZoneId": _round_lock["battleZoneId"],
+                "ageSeconds": int(age),
+            })
+        return jsonify({"battleId": None, "battleZoneId": None})
+
+
+@app.route('/round-lock', methods=['POST'])
+def round_lock_set():
+    if not _check_api_secret():
+        return jsonify({"error": "unauthorized"}), 401
+    body = request.get_json(force=True, silent=True) or {}
+    battle_id = body.get("battleId") or None
+    battle_zone_id = body.get("battleZoneId") or None
+    with _round_lock_lock:
+        if battle_id and battle_zone_id:
+            _round_lock["battleId"] = str(battle_id)
+            _round_lock["battleZoneId"] = str(battle_zone_id)
+            _round_lock["updatedAt"] = time.time()
+        else:
+            # boş gönderilirse kilidi temizle (round bitti/tamamlandı)
+            _round_lock["battleId"] = None
+            _round_lock["battleZoneId"] = None
+            _round_lock["updatedAt"] = 0
+    return jsonify({"ok": True})
+
+
 # --- TELEGRAM (modul seviyesinde - hem bot_loop hem Flask route'lari kullanabilsin) ---
 TG_TOKEN = os.environ.get("TG_TOKEN", "BURAYA_TOKEN_KOYUN")
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "BURAYA_CHAT_ID_KOYUN")
