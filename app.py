@@ -282,7 +282,7 @@ def bot_loop():
         "ARM Hammadde|https://erepublik.tools/en/marketplace/items/0/24/1/offers|50|20|0,"
         "Hava Silahi Q5|https://erepublik.tools/en/marketplace/items/0/23/5/offers|0|5|0,"
         "Silah Q7|https://erepublik.tools/en/marketplace/items/0/2/7/offers|100|10|0,"
-        "Bilet Q5|https://erepublik.tools/en/marketplace/items/0/3/5/offers|10|5|0,"
+        "Bilet Q5|https://erepublik.tools/en/marketplace/items/0/3/5/offers|50|5|0,"
         "Ev Q1|https://erepublik.tools/en/marketplace/items/0/4/1/offers|0|5|0,"
         "Ev Q2|https://erepublik.tools/en/marketplace/items/0/4/2/offers|0|5|0,"
         "Ev Q3|https://erepublik.tools/en/marketplace/items/0/4/3/offers|0|5|0,"
@@ -395,6 +395,10 @@ def bot_loop():
                 job_link = job_link_tag["href"] if job_link_tag and job_link_tag.has_attr("href") else ""
 
                 if net is None:
+                    continue
+                overtime_num = parse_number(overtime)
+                if overtime_num is None or overtime_num < 3:
+                    # Mesai en az 3 olmayan ilanlari hic degerlendirmeye almiyoruz.
                     continue
                 if best is None or net > best[0]:
                     best = (net, name, gross, overtime, job_link)
