@@ -15,7 +15,7 @@ app = Flask(__name__)
 # GM storage'ın YERİNE değil, YANINDA bir yedek olarak çalışır.
 API_SECRET = os.environ.get("API_SECRET", "")
 ROUND_LOCK_TTL_SECONDS = 3 * 3600
-_round_lock = {"battleId": None, "battleZoneId": None, "updatedAt": 0}
+_round_lock = {"battleId": None, "battleZoneId": None, "spent": None, "updatedAt": 0}
 _round_lock_lock = threading.Lock()
 
 
@@ -36,9 +36,10 @@ def round_lock_get():
             return jsonify({
                 "battleId": _round_lock["battleId"],
                 "battleZoneId": _round_lock["battleZoneId"],
+                "spent": _round_lock["spent"],
                 "ageSeconds": int(age),
             })
-        return jsonify({"battleId": None, "battleZoneId": None})
+        return jsonify({"battleId": None, "battleZoneId": None, "spent": None})
 
 
 @app.route('/round-lock', methods=['POST'])
@@ -48,15 +49,19 @@ def round_lock_set():
     body = request.get_json(force=True, silent=True) or {}
     battle_id = body.get("battleId") or None
     battle_zone_id = body.get("battleZoneId") or None
+    spent = body.get("spent")
     with _round_lock_lock:
         if battle_id and battle_zone_id:
             _round_lock["battleId"] = str(battle_id)
             _round_lock["battleZoneId"] = str(battle_zone_id)
+            if isinstance(spent, (int, float)):
+                _round_lock["spent"] = spent
             _round_lock["updatedAt"] = time.time()
         else:
             # boş gönderilirse kilidi temizle (round bitti/tamamlandı)
             _round_lock["battleId"] = None
             _round_lock["battleZoneId"] = None
+            _round_lock["spent"] = None
             _round_lock["updatedAt"] = 0
     return jsonify({"ok": True})
 
@@ -278,8 +283,8 @@ def bot_loop():
         "Ekmek Q7|https://erepublik.tools/en/marketplace/items/0/1/7/offers|500|10|20,"
         "FRM Hammadde|https://erepublik.tools/en/marketplace/items/0/7/1/offers|50|5|0,"
         "WRM Hammadde|https://erepublik.tools/en/marketplace/items/0/12/1/offers|50|5|0,"
-        "HRM Hammadde|https://erepublik.tools/en/marketplace/items/0/17/1/offers|50|20|0,"
-        "ARM Hammadde|https://erepublik.tools/en/marketplace/items/0/24/1/offers|50|20|0,"
+        "HRM Hammadde|https://erepublik.tools/en/marketplace/items/0/17/1/offers|50|15|0,"
+        "ARM Hammadde|https://erepublik.tools/en/marketplace/items/0/24/1/offers|50|15|0,"
         "Hava Silahi Q5|https://erepublik.tools/en/marketplace/items/0/23/5/offers|0|5|0,"
         "Silah Q7|https://erepublik.tools/en/marketplace/items/0/2/7/offers|100|10|0,"
         "Bilet Q5|https://erepublik.tools/en/marketplace/items/0/3/5/offers|50|5|0,"
