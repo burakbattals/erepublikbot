@@ -555,6 +555,156 @@ def bot_loop():
             time.sleep(30)
 
 
+# ============ PAZAR HAREKETI (alim-satim sikligi tahmini) ============
+# erepublik.tools'un JSON API'sinden (service.erepublik.tools) her urunun en ucuz
+# 30 teklifini periyodik ceker; iki ardisik goruntu arasindaki farktan "kac adet
+# satildi" tahmini cikarir. Sonuc /market-activity ile Tampermonkey paneline gider.
+#   * min = teklif adedi AZALANLAR (kesin alim)
+#   * max = min + pencerede gorunurken kaybolan teklifler (alindi VEYA iptal edildi)
+# Render ENV (hepsi opsiyonel):
+#   ACTIVITY_ENABLED=1|0, ACTIVITY_INTERVAL_SEC=180 (en az 120), 
+#   ACTIVITY_ITEMS="7:1,12:1,17:1,24:1,4:1,23:5,2:7"  (sanayi:kalite)
+#   ACTIVITY_COUNTRIES="0"  (0=Global; ornek "0,41,35" -> Rusya ve Polonya pazar defterleri de izlenir)
+ACT_ENABLED = os.environ.get("ACTIVITY_ENABLED", "1") == "1"
+ACT_API = "https://service.erepublik.tools/api/v1/market/item/{c}/{i}/{q}"
+ACT_INTERVAL = max(120, int(os.environ.get("ACTIVITY_INTERVAL_SEC", "180")))
+ACT_ITEMS = [x.strip() for x in os.environ.get(
+    "ACTIVITY_ITEMS", "7:1,12:1,17:1,24:1,4:1,23:5,2:7").split(",") if x.strip()]
+ACT_COUNTRIES = [x.strip() for x in os.environ.get("ACTIVITY_COUNTRIES", "0").split(",") if x.strip()]
+ACT_FILE = os.environ.get("ACTIVITY_FILE", "/tmp/market_activity.json")
+ACT_WINDOW = 30          # API en ucuz 30 teklifi donduruyor
+ACT_BUCKET = 600         # 10 dakikalik kovalar
+ACT_KEEP = 30 * 3600     # 30 saat geriye kadar sakla
+_act = {}
+_act_lock = threading.Lock()
+
+
+def _act_apply(key, offers, ts):
+    """Yeni goruntuyu bir oncekiyle karsilastirip kovaya yazar. Saf fonksiyon (test edilebilir)."""
+    cur = {}
+    for o in offers:
+        try:
+            cur[int(o["id"])] = (float(o["amount"]), float(o["gross"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+    if not cur:
+        return
+    with _act_lock:
+        st = _act.setdefault(key, {"prev": None, "prev_ts": 0.0, "first_ts": ts, "snaps": 0, "buckets": {}})
+        prev, prev_ts = st["prev"], st["prev_ts"]
+        if prev and 0 < ts - prev_ts <= ACT_INTERVAL * 3:
+            # Liste 30'dan kisaysa tum defteri goruyoruz: kaybolan her teklif gercekten gitmistir.
+            cur_max = float("inf") if len(cur) < ACT_WINDOW else max(g for _, g in cur.values())
+            prev_max = float("inf") if len(prev) < ACT_WINDOW else max(g for _, g in prev.values())
+            partial = gone = listed = 0.0
+            for oid, (amt, g) in prev.items():
+                c = cur.get(oid)
+                if c is not None:
+                    if c[0] < amt:
+                        partial += amt - c[0]          # kismi alim: kesin
+                elif g <= cur_max:
+                    gone += amt                        # gorunur aralikta iken kayboldu: alindi/iptal
+                # g > cur_max ise pencereden fiyat yuzunden dustu, sayilmaz
+            for oid, (amt, g) in cur.items():
+                if oid not in prev and g <= prev_max:
+                    listed += amt                      # yeni ilan
+            bk = str(int(ts // ACT_BUCKET))
+            b = st["buckets"].setdefault(bk, {"p": 0.0, "g": 0.0, "l": 0.0})
+            b["p"] += partial
+            b["g"] += gone
+            b["l"] += listed
+        st["prev"], st["prev_ts"] = cur, ts
+        st["snaps"] += 1
+        limit = int((ts - ACT_KEEP) // ACT_BUCKET)
+        for k in [k for k in st["buckets"] if int(k) < limit]:
+            del st["buckets"][k]
+
+
+def _act_summary(now):
+    out = {}
+    with _act_lock:
+        for key, st in _act.items():
+            res = {"snaps": st["snaps"], "first_ts": st["first_ts"], "last_ts": st["prev_ts"],
+                   "interval": ACT_INTERVAL}
+            for label, hrs in (("h1", 1), ("h6", 6), ("h24", 24)):
+                lo = int((now - hrs * 3600) // ACT_BUCKET)
+                p = g = l = 0.0
+                for k, b in st["buckets"].items():
+                    if int(k) >= lo:
+                        p += b["p"]; g += b["g"]; l += b["l"]
+                res[label] = {"min": round(p, 1), "max": round(p + g, 1), "listed": round(l, 1),
+                              "hours": round(min(hrs, max(0.0, (now - st["first_ts"]) / 3600.0)), 2)}
+            out[key] = res
+    return out
+
+
+def _act_save():
+    try:
+        import json
+        with _act_lock:
+            data = {k: {"prev": {str(i): list(v) for i, v in (st["prev"] or {}).items()},
+                        "prev_ts": st["prev_ts"], "first_ts": st["first_ts"],
+                        "snaps": st["snaps"], "buckets": st["buckets"]} for k, st in _act.items()}
+        with open(ACT_FILE, "w") as f:
+            json.dump(data, f)
+    except Exception as e:
+        print(f"[HAREKET] kayit hatasi: {e}")
+
+
+def _act_load():
+    try:
+        import json
+        with open(ACT_FILE) as f:
+            data = json.load(f)
+        with _act_lock:
+            for k, st in data.items():
+                _act[k] = {"prev": {int(i): tuple(v) for i, v in st["prev"].items()},
+                           "prev_ts": st["prev_ts"], "first_ts": st["first_ts"],
+                           "snaps": st["snaps"], "buckets": st["buckets"]}
+        print(f"[HAREKET] {len(data)} kalem diskten yuklendi.")
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        print(f"[HAREKET] yukleme hatasi: {e}")
+
+
+def _act_loop():
+    hdr = {"Accept": "application/json, text/plain, */*", "Referer": "https://erepublik.tools/",
+           "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                         "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
+    _act_load()
+    last_save = time.time()
+    while True:
+        started = time.time()
+        for c in ACT_COUNTRIES:
+            for it in ACT_ITEMS:
+                try:
+                    i, q = it.split(":")
+                    r = requests.get(ACT_API.format(c=c, i=i, q=q), headers=hdr, timeout=15)
+                    r.raise_for_status()
+                    d = r.json()
+                    if d.get("status") == "ok":
+                        _act_apply(f"{c}:{i}:{q}", d.get("offers") or [], time.time())
+                except Exception as e:
+                    print(f"[HAREKET] {c}:{it} hatasi: {e}")
+                time.sleep(1.0)   # siteye nazik ol
+        if time.time() - last_save > 600:
+            _act_save()
+            last_save = time.time()
+        time.sleep(max(5, ACT_INTERVAL - (time.time() - started)))
+
+
+@app.route('/market-activity')
+def market_activity():
+    if not _check_api_secret():
+        return jsonify({"error": "unauthorized"}), 401
+    return jsonify({"now": time.time(), "items": _act_summary(time.time())})
+
+
+if ACT_ENABLED:
+    threading.Thread(target=_act_loop, daemon=True).start()
+
+
 # Thread'i modul seviyesinde baslatiyoruz - Render'da "gunicorn app:app" gibi
 # bir start command kullanilsa bile bot thread'i mutlaka baslasin diye.
 _bot_thread = threading.Thread(target=bot_loop, daemon=True)
