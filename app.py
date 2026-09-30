@@ -555,117 +555,226 @@ def bot_loop():
             time.sleep(30)
 
 
-# ============ PAZAR HAREKETI (alim-satim sikligi tahmini) ============
-# erepublik.tools'un JSON API'sinden (service.erepublik.tools) her urunun en ucuz
-# 30 teklifini periyodik ceker; iki ardisik goruntu arasindaki farktan "kac adet
-# satildi" tahmini cikarir. Sonuc /market-activity ile Tampermonkey paneline gider.
-#   * min = teklif adedi AZALANLAR (kesin alim)
-#   * max = min + pencerede gorunurken kaybolan teklifler (alindi VEYA iptal edildi)
+# ============ PAZAR HAREKETI + ULKE TARAMA (erepublik.tools JSON API) ============
+# 1) Global ve "izlenen" ulke defterleri sik aralikla alinir; iki goruntu arasindaki farktan
+#    satis tahmini cikarilir (min = adedi azalan teklifler = kesin alim,
+#    max = min + gorunur aralikta kaybolan teklifler = alindi VEYA iptal).
+# 2) Diger tum ulkeler yavas yavas taranir (sadece en ucuz fiyat + ust uste ortalama).
+# 3) Hangi ulkelerin izlenecegini Tampermonkey paneli /market-watch ile bildirir.
+# Veri sakligi sinirli: 12 saat 10 dk'lik, 7 gun saatlik, 30 gun gunluk ORTALAMA/TOPLAM; sonra silinir.
 # Render ENV (hepsi opsiyonel):
-#   ACTIVITY_ENABLED=1|0, ACTIVITY_INTERVAL_SEC=180 (en az 120), 
-#   ACTIVITY_ITEMS="7:1,12:1,17:1,24:1,4:1,23:5,2:7"  (sanayi:kalite)
-#   ACTIVITY_COUNTRIES="0"  (0=Global; ornek "0,41,35" -> Rusya ve Polonya pazar defterleri de izlenir)
+#   ACTIVITY_ENABLED=1, ACTIVITY_INTERVAL_SEC=180 (global), WATCH_INTERVAL_SEC=600 (izlenen ulkeler),
+#   MAX_WATCH=10, SCAN_ENABLED=1, SCAN_GAP_SEC=20 (taramada istekler arasi sn),
+#   ACTIVITY_ITEMS="7:1,12:1,17:1,24:1,4:1,23:5,2:7", SCAN_COUNTRIES="1,9,10,...", ASK_MIN_UNITS=10
+import math
+import json as _json
+
 ACT_ENABLED = os.environ.get("ACTIVITY_ENABLED", "1") == "1"
 ACT_API = "https://service.erepublik.tools/api/v1/market/item/{c}/{i}/{q}"
 ACT_INTERVAL = max(120, int(os.environ.get("ACTIVITY_INTERVAL_SEC", "180")))
+WATCH_INTERVAL = max(300, int(os.environ.get("WATCH_INTERVAL_SEC", "600")))
+MAX_WATCH = max(1, int(os.environ.get("MAX_WATCH", "10")))
+SCAN_ENABLED = os.environ.get("SCAN_ENABLED", "1") == "1"
+SCAN_GAP = max(10, int(os.environ.get("SCAN_GAP_SEC", "20")))
+ASK_MIN_UNITS = int(os.environ.get("ASK_MIN_UNITS", "10"))
 ACT_ITEMS = [x.strip() for x in os.environ.get(
     "ACTIVITY_ITEMS", "7:1,12:1,17:1,24:1,4:1,23:5,2:7").split(",") if x.strip()]
-ACT_COUNTRIES = [x.strip() for x in os.environ.get("ACTIVITY_COUNTRIES", "0").split(",") if x.strip()]
+SCAN_COUNTRIES = [x.strip() for x in os.environ.get(
+    "SCAN_COUNTRIES",
+    "1,9,10,11,12,13,14,15,23,24,26,27,28,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,47,48,49,"
+    "51,52,54,55,56,57,58,59,61,63,64,65,66,67,68,69,70,71,72,73,74,75,76,77,78,79,80,81,82,83,84,"
+    "164,165,166,167,168,169,170").split(",") if x.strip()]
 ACT_FILE = os.environ.get("ACTIVITY_FILE", "/tmp/market_activity.json")
-ACT_WINDOW = 30          # API en ucuz 30 teklifi donduruyor
-ACT_BUCKET = 600         # 10 dakikalik kovalar
-ACT_KEEP = 30 * 3600     # 30 saat geriye kadar sakla
-_act = {}
+ACT_WINDOW = 30            # API en ucuz 30 teklifi donduruyor
+FINE_SEC, FINE_KEEP = 600, 12 * 3600
+HOUR_KEEP, DAY_KEEP = 7 * 86400, 30 * 86400
+_act = {}                  # "ulke:sanayi:kalite" -> durum
+_scan = {}                 # "ulke:sanayi:kalite" -> {"ts","ask","ema","n"}
+_watch = {"countries": [], "skip": [], "ts": 0.0}
 _act_lock = threading.Lock()
+_act_pause_until = 0.0
 
 
-def _act_apply(key, offers, ts):
-    """Yeni goruntuyu bir oncekiyle karsilastirip kovaya yazar. Saf fonksiyon (test edilebilir)."""
+def _b_add(dst, src):
+    for i in range(5):
+        dst[i] += src[i]
+
+
+def _act_compact(st, ts):
+    """Eski ince kovalari saatliğe, eski saatlikleri gunluge katlar; en eskiyi siler (boyut sabit kalsin)."""
+    lo = int((ts - FINE_KEEP) // FINE_SEC)
+    for k in [k for k in st["fine"] if int(k) < lo]:
+        _b_add(st["hour"].setdefault(str(int(k) * FINE_SEC // 3600), [0.0] * 5), st["fine"].pop(k))
+    lo = int((ts - HOUR_KEEP) // 3600)
+    for k in [k for k in st["hour"] if int(k) < lo]:
+        _b_add(st["day"].setdefault(str(int(k) * 3600 // 86400), [0.0] * 5), st["hour"].pop(k))
+    lo = int((ts - DAY_KEEP) // 86400)
+    for k in [k for k in st["day"] if int(k) < lo]:
+        del st["day"][k]
+
+
+def _act_apply(key, offers, ts, interval):
+    """Yeni goruntuyu oncekiyle karsilastirip kovaya yazar. Saf fonksiyon (test edilebilir)."""
     cur = {}
     for o in offers:
         try:
             cur[int(o["id"])] = (float(o["amount"]), float(o["gross"]))
         except (KeyError, TypeError, ValueError):
             continue
-    if not cur:
-        return
     with _act_lock:
-        st = _act.setdefault(key, {"prev": None, "prev_ts": 0.0, "first_ts": ts, "snaps": 0, "buckets": {}})
+        st = _act.setdefault(key, {"prev": None, "prev_ts": 0.0, "first_ts": ts, "snaps": 0,
+                                   "interval": interval, "fine": {}, "hour": {}, "day": {}})
+        st["interval"] = interval
         prev, prev_ts = st["prev"], st["prev_ts"]
-        if prev and 0 < ts - prev_ts <= ACT_INTERVAL * 3:
-            # Liste 30'dan kisaysa tum defteri goruyoruz: kaybolan her teklif gercekten gitmistir.
+        if prev and 0 < ts - prev_ts <= interval * 3:
             cur_max = float("inf") if len(cur) < ACT_WINDOW else max(g for _, g in cur.values())
             prev_max = float("inf") if len(prev) < ACT_WINDOW else max(g for _, g in prev.values())
-            partial = gone = listed = 0.0
+            b = [0.0] * 5    # [kesin adet, kaybolan adet, yeni ilan adedi, kesin deger, kaybolan deger]
             for oid, (amt, g) in prev.items():
                 c = cur.get(oid)
                 if c is not None:
                     if c[0] < amt:
-                        partial += amt - c[0]          # kismi alim: kesin
+                        b[0] += amt - c[0]; b[3] += (amt - c[0]) * g
                 elif g <= cur_max:
-                    gone += amt                        # gorunur aralikta iken kayboldu: alindi/iptal
-                # g > cur_max ise pencereden fiyat yuzunden dustu, sayilmaz
+                    b[1] += amt; b[4] += amt * g
+                # g > cur_max: pencereden fiyat yuzunden dustu, sayilmaz
             for oid, (amt, g) in cur.items():
                 if oid not in prev and g <= prev_max:
-                    listed += amt                      # yeni ilan
-            bk = str(int(ts // ACT_BUCKET))
-            b = st["buckets"].setdefault(bk, {"p": 0.0, "g": 0.0, "l": 0.0})
-            b["p"] += partial
-            b["g"] += gone
-            b["l"] += listed
+                    b[2] += amt
+            _b_add(st["fine"].setdefault(str(int(ts // FINE_SEC)), [0.0] * 5), b)
         st["prev"], st["prev_ts"] = cur, ts
         st["snaps"] += 1
-        limit = int((ts - ACT_KEEP) // ACT_BUCKET)
-        for k in [k for k in st["buckets"] if int(k) < limit]:
-            del st["buckets"][k]
+        _act_compact(st, ts)
+
+
+def _ask_of(offers):
+    best = anyp = None
+    for o in offers:
+        try:
+            amt, g = float(o["amount"]), float(o["gross"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if anyp is None or g < anyp:
+            anyp = g
+        if amt >= ASK_MIN_UNITS and (best is None or g < best):
+            best = g
+    return best if best is not None else anyp
+
+
+def _scan_update(key, offers, ts):
+    ask = _ask_of(offers)
+    n = len(offers)
+    with _act_lock:
+        s = _scan.get(key)
+        if s is None:
+            _scan[key] = {"ts": ts, "ask": ask, "ema": ask, "n": n}
+            return
+        if ask is not None:
+            if s.get("ema") is None:
+                s["ema"] = ask
+            else:   # 24 saatlik zaman-tabanli ustel ortalama
+                a = 1 - math.exp(-max(0.0, ts - s["ts"]) / 86400.0)
+                s["ema"] += (ask - s["ema"]) * a
+        s.update(ts=ts, ask=ask, n=n)
+
+
+def _sum_window(st, now, hrs):
+    lo = now - hrs * 3600
+    tot = [0.0] * 5
+    for tier, size in (("fine", FINE_SEC), ("hour", 3600), ("day", 86400)):
+        for k, b in st[tier].items():
+            if int(k) * size >= lo:
+                _b_add(tot, b)
+    return tot
 
 
 def _act_summary(now):
     out = {}
     with _act_lock:
         for key, st in _act.items():
+            s = _scan.get(key) or {}
             res = {"snaps": st["snaps"], "first_ts": st["first_ts"], "last_ts": st["prev_ts"],
-                   "interval": ACT_INTERVAL}
-            for label, hrs in (("h1", 1), ("h6", 6), ("h24", 24)):
-                lo = int((now - hrs * 3600) // ACT_BUCKET)
-                p = g = l = 0.0
-                for k, b in st["buckets"].items():
-                    if int(k) >= lo:
-                        p += b["p"]; g += b["g"]; l += b["l"]
+                   "interval": st["interval"], "ask": s.get("ask"), "ema": s.get("ema"), "n": s.get("n")}
+            for label, hrs in (("h1", 1), ("h6", 6), ("h24", 24), ("d7", 168), ("d30", 720)):
+                p, g, l, pv, gv = _sum_window(st, now, hrs)
                 res[label] = {"min": round(p, 1), "max": round(p + g, 1), "listed": round(l, 1),
-                              "hours": round(min(hrs, max(0.0, (now - st["first_ts"]) / 3600.0)), 2)}
+                              "hours": round(min(hrs, max(0.0, (now - st["first_ts"]) / 3600.0)), 2),
+                              "avg_p": round(pv / p, 4) if p > 0 else None,
+                              "avg_all": round((pv + gv) / (p + g), 4) if (p + g) > 0 else None}
             out[key] = res
     return out
 
 
 def _act_save():
     try:
-        import json
         with _act_lock:
-            data = {k: {"prev": {str(i): list(v) for i, v in (st["prev"] or {}).items()},
-                        "prev_ts": st["prev_ts"], "first_ts": st["first_ts"],
-                        "snaps": st["snaps"], "buckets": st["buckets"]} for k, st in _act.items()}
-        with open(ACT_FILE, "w") as f:
-            json.dump(data, f)
+            data = {"v": 2, "watch": dict(_watch), "scan": dict(_scan),
+                    "act": {k: {"prev": {str(i): list(v) for i, v in (st["prev"] or {}).items()},
+                                "prev_ts": st["prev_ts"], "first_ts": st["first_ts"], "snaps": st["snaps"],
+                                "interval": st["interval"], "fine": st["fine"], "hour": st["hour"],
+                                "day": st["day"]} for k, st in _act.items()}}
+        tmp = ACT_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            _json.dump(data, f)
+        os.replace(tmp, ACT_FILE)
     except Exception as e:
         print(f"[HAREKET] kayit hatasi: {e}")
 
 
 def _act_load():
     try:
-        import json
         with open(ACT_FILE) as f:
-            data = json.load(f)
+            data = _json.load(f)
+        if data.get("v") != 2:
+            return
         with _act_lock:
-            for k, st in data.items():
+            _watch.update(data.get("watch") or {})
+            _scan.update(data.get("scan") or {})
+            for k, st in (data.get("act") or {}).items():
                 _act[k] = {"prev": {int(i): tuple(v) for i, v in st["prev"].items()},
-                           "prev_ts": st["prev_ts"], "first_ts": st["first_ts"],
-                           "snaps": st["snaps"], "buckets": st["buckets"]}
-        print(f"[HAREKET] {len(data)} kalem diskten yuklendi.")
+                           "prev_ts": st["prev_ts"], "first_ts": st["first_ts"], "snaps": st["snaps"],
+                           "interval": st.get("interval", ACT_INTERVAL),
+                           "fine": st["fine"], "hour": st["hour"], "day": st["day"]}
+        print(f"[HAREKET] diskten yuklendi: {len(_act)} defter, {len(_scan)} tarama kaydi.")
     except FileNotFoundError:
         pass
     except Exception as e:
         print(f"[HAREKET] yukleme hatasi: {e}")
+
+
+def _act_tracked():
+    out = [(f"0:{it}", ACT_INTERVAL) for it in ACT_ITEMS]
+    with _act_lock:
+        ws = list(_watch["countries"])[:MAX_WATCH]
+    for c in ws:
+        out += [(f"{c}:{it}", WATCH_INTERVAL) for it in ACT_ITEMS]
+    return out
+
+
+def _scan_keys():
+    with _act_lock:
+        skip = set(_watch["skip"]) | set(_watch["countries"]) | {"0"}
+    return [f"{c}:{it}" for c in SCAN_COUNTRIES if c not in skip for it in ACT_ITEMS]
+
+
+def _act_fetch(key, hdr):
+    """Tek defter ceker. Basarisizlikta None; 403/429/5xx'te 5 dk mola verir."""
+    global _act_pause_until
+    c, i, q = key.split(":")
+    try:
+        r = requests.get(ACT_API.format(c=c, i=i, q=q), headers=hdr, timeout=15)
+        if r.status_code in (403, 429, 500, 502, 503):
+            _act_pause_until = time.time() + 300
+            print(f"[HAREKET] {key} HTTP {r.status_code} - 5 dk mola")
+            return None
+        r.raise_for_status()
+        d = r.json()
+        if d.get("status") != "ok":
+            return None
+        return d.get("offers") or []
+    except Exception as e:
+        print(f"[HAREKET] {key} hatasi: {e}")
+        return None
 
 
 def _act_loop():
@@ -673,25 +782,39 @@ def _act_loop():
            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                          "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
     _act_load()
-    last_save = time.time()
+    due, scan_idx, last_scan, last_save = {}, 0, 0.0, time.time()
     while True:
-        started = time.time()
-        for c in ACT_COUNTRIES:
-            for it in ACT_ITEMS:
-                try:
-                    i, q = it.split(":")
-                    r = requests.get(ACT_API.format(c=c, i=i, q=q), headers=hdr, timeout=15)
-                    r.raise_for_status()
-                    d = r.json()
-                    if d.get("status") == "ok":
-                        _act_apply(f"{c}:{i}:{q}", d.get("offers") or [], time.time())
-                except Exception as e:
-                    print(f"[HAREKET] {c}:{it} hatasi: {e}")
-                time.sleep(1.0)   # siteye nazik ol
-        if time.time() - last_save > 600:
-            _act_save()
-            last_save = time.time()
-        time.sleep(max(5, ACT_INTERVAL - (time.time() - started)))
+        try:
+            now = time.time()
+            if now >= _act_pause_until:
+                pick = None
+                for key, itv in _act_tracked():
+                    d = due.get(key, 0.0)
+                    if d <= now and (pick is None or d < pick[2]):
+                        pick = (key, itv, d)
+                if pick:
+                    key, itv, _ = pick
+                    offers = _act_fetch(key, hdr)
+                    due[key] = time.time() + itv
+                    if offers is not None:
+                        t = time.time()
+                        _act_apply(key, offers, t, itv)
+                        _scan_update(key, offers, t)
+                elif SCAN_ENABLED and now - last_scan >= SCAN_GAP:
+                    keys = _scan_keys()
+                    if keys:
+                        scan_idx %= len(keys)
+                        offers = _act_fetch(keys[scan_idx], hdr)
+                        scan_idx += 1
+                        if offers is not None:
+                            _scan_update(keys[scan_idx - 1], offers, time.time())
+                    last_scan = time.time()
+            if time.time() - last_save > 600:
+                _act_save()
+                last_save = time.time()
+        except Exception as e:
+            print(f"[HAREKET] dongu hatasi: {e}")
+        time.sleep(1.5)
 
 
 @app.route('/market-activity')
@@ -699,6 +822,42 @@ def market_activity():
     if not _check_api_secret():
         return jsonify({"error": "unauthorized"}), 401
     return jsonify({"now": time.time(), "items": _act_summary(time.time())})
+
+
+@app.route('/market-scan')
+def market_scan():
+    if not _check_api_secret():
+        return jsonify({"error": "unauthorized"}), 401
+    with _act_lock:
+        data = {k: dict(v) for k, v in _scan.items()}
+    return jsonify({"now": time.time(), "scan": data, "gap": SCAN_GAP,
+                    "keys": len(_scan_keys()) if SCAN_ENABLED else 0})
+
+
+@app.route('/market-watch', methods=['GET', 'POST'])
+def market_watch():
+    if not _check_api_secret():
+        return jsonify({"error": "unauthorized"}), 401
+    if request.method == 'POST':
+        body = request.get_json(force=True, silent=True) or {}
+
+        def ids(v, cap):
+            out = []
+            for x in (v or [])[:cap]:
+                try:
+                    s = str(int(x))
+                except (TypeError, ValueError):
+                    continue
+                if s not in out and int(s) > 0:
+                    out.append(s)
+            return out
+        with _act_lock:
+            _watch["countries"] = ids(body.get("countries"), MAX_WATCH)
+            _watch["skip"] = ids(body.get("skip"), 100)
+            _watch["ts"] = time.time()
+        _act_save()
+    with _act_lock:
+        return jsonify(dict(_watch, max=MAX_WATCH))
 
 
 if ACT_ENABLED:
