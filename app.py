@@ -595,6 +595,19 @@ _scan = {}                 # "ulke:sanayi:kalite" -> {"ts","ask","ema","n"}
 _watch = {"countries": [], "skip": [], "ts": 0.0}
 _act_lock = threading.Lock()
 _act_pause_until = 0.0
+_act_stats = {"global_ok": 0, "global_err": 0, "country_ok": 0, "country_err": 0,
+              "last_err": "", "last_err_key": "", "last_ok_ts": 0.0}
+
+
+def _stat(key, ok, err=""):
+    kind = "global" if key.startswith("0:") else "country"
+    with _act_lock:
+        _act_stats[f"{kind}_{'ok' if ok else 'err'}"] += 1
+        if ok:
+            _act_stats["last_ok_ts"] = time.time()
+        else:
+            _act_stats["last_err"] = str(err)[:160]
+            _act_stats["last_err_key"] = key
 
 
 HIST_LN = math.log(1.01)      # fiyat dilimi: %1'lik (logaritmik); istemci 1.01**dilim ile fiyati geri kurar
@@ -805,14 +818,18 @@ def _act_fetch(key, hdr):
         if r.status_code in (403, 429, 500, 502, 503):
             _act_pause_until = time.time() + 300
             print(f"[HAREKET] {key} HTTP {r.status_code} - 5 dk mola")
+            _stat(key, False, f"HTTP {r.status_code}")
             return None
         r.raise_for_status()
         d = r.json()
         if d.get("status") != "ok":
+            _stat(key, False, f"status={d.get('status')}")
             return None
+        _stat(key, True)
         return d.get("offers") or []
     except Exception as e:
         print(f"[HAREKET] {key} hatasi: {e}")
+        _stat(key, False, e)
         return None
 
 
@@ -860,7 +877,9 @@ def _act_loop():
 def market_activity():
     if not _check_api_secret():
         return jsonify({"error": "unauthorized"}), 401
-    return jsonify({"now": time.time(), "items": _act_summary(time.time())})
+    with _act_lock:
+        stats = dict(_act_stats)
+    return jsonify({"now": time.time(), "items": _act_summary(time.time()), "stats": stats})
 
 
 @app.route('/market-scan')
@@ -869,8 +888,9 @@ def market_scan():
         return jsonify({"error": "unauthorized"}), 401
     with _act_lock:
         data = {k: dict(v) for k, v in _scan.items()}
+        stats = dict(_act_stats)
     return jsonify({"now": time.time(), "scan": data, "gap": SCAN_GAP,
-                    "keys": len(_scan_keys()) if SCAN_ENABLED else 0})
+                    "keys": len(_scan_keys()) if SCAN_ENABLED else 0, "stats": stats})
 
 
 @app.route('/market-watch', methods=['GET', 'POST'])
