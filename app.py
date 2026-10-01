@@ -561,7 +561,9 @@ def bot_loop():
 #    max = min + gorunur aralikta kaybolan teklifler = alindi VEYA iptal).
 # 2) Diger tum ulkeler yavas yavas taranir (sadece en ucuz fiyat + ust uste ortalama).
 # 3) Hangi ulkelerin izlenecegini Tampermonkey paneli /market-watch ile bildirir.
-# Veri sakligi sinirli: 12 saat 10 dk'lik, 7 gun saatlik, 30 gun gunluk ORTALAMA/TOPLAM; sonra silinir.
+# 4) Kesin alimlar FIYAT ARALIGINA gore de tutulur (%1'lik dilimler): istemci "kârli fiyatlardan kac adet satildi"yi
+#    hesaplar; yuksek fiyat ama alici yok durumu (tuzak) boyle ayirt edilir.
+# Veri sakligi sinirli: 12 saat 10 dk'lik, 7 gun saatlik, 30 gun gunluk TOPLAM; sonra silinir.
 # Render ENV (hepsi opsiyonel):
 #   ACTIVITY_ENABLED=1, ACTIVITY_INTERVAL_SEC=180 (global), WATCH_INTERVAL_SEC=600 (izlenen ulkeler),
 #   MAX_WATCH=10, SCAN_ENABLED=1, SCAN_GAP_SEC=20 (taramada istekler arasi sn),
@@ -595,19 +597,36 @@ _act_lock = threading.Lock()
 _act_pause_until = 0.0
 
 
-def _b_add(dst, src):
+HIST_LN = math.log(1.01)      # fiyat dilimi: %1'lik (logaritmik); istemci 1.01**dilim ile fiyati geri kurar
+
+
+def _bin(price):
+    return int(round(math.log(price) / HIST_LN))
+
+
+def _new_b():
+    return {"v": [0.0] * 5, "h": {}}   # v=[kesin adet, kaybolan adet, yeni ilan, kesin deger, kaybolan deger]; h={dilim:[kesin, kaybolan]}
+
+
+def _b_add(dst, src, cap=None):
     for i in range(5):
-        dst[i] += src[i]
+        dst["v"][i] += src["v"][i]
+    for k, (p, g) in src["h"].items():
+        d = dst["h"].setdefault(k, [0.0, 0.0])
+        d[0] += p
+        d[1] += g
+    if cap is not None and len(dst["h"]) > cap:       # boyut sabit kalsin: en kucuk hacimli dilimleri at (0 = hepsini at)
+        dst["h"] = dict(sorted(dst["h"].items(), key=lambda kv: -(kv[1][0] + kv[1][1]))[:cap])
 
 
 def _act_compact(st, ts):
     """Eski ince kovalari saatliğe, eski saatlikleri gunluge katlar; en eskiyi siler (boyut sabit kalsin)."""
     lo = int((ts - FINE_KEEP) // FINE_SEC)
     for k in [k for k in st["fine"] if int(k) < lo]:
-        _b_add(st["hour"].setdefault(str(int(k) * FINE_SEC // 3600), [0.0] * 5), st["fine"].pop(k))
+        _b_add(st["hour"].setdefault(str(int(k) * FINE_SEC // 3600), _new_b()), st["fine"].pop(k), 16)
     lo = int((ts - HOUR_KEEP) // 3600)
     for k in [k for k in st["hour"] if int(k) < lo]:
-        _b_add(st["day"].setdefault(str(int(k) * 3600 // 86400), [0.0] * 5), st["hour"].pop(k))
+        _b_add(st["day"].setdefault(str(int(k) * 3600 // 86400), _new_b()), st["hour"].pop(k), 0)      # 7 gunden eski fiyat dilimleri kullanilmaz: yalniz toplamlar kalir
     lo = int((ts - DAY_KEEP) // 86400)
     for k in [k for k in st["day"] if int(k) < lo]:
         del st["day"][k]
@@ -629,19 +648,22 @@ def _act_apply(key, offers, ts, interval):
         if prev and 0 < ts - prev_ts <= interval * 3:
             cur_max = float("inf") if len(cur) < ACT_WINDOW else max(g for _, g in cur.values())
             prev_max = float("inf") if len(prev) < ACT_WINDOW else max(g for _, g in prev.values())
-            b = [0.0] * 5    # [kesin adet, kaybolan adet, yeni ilan adedi, kesin deger, kaybolan deger]
+            b = _new_b()
             for oid, (amt, g) in prev.items():
                 c = cur.get(oid)
                 if c is not None:
-                    if c[0] < amt:
-                        b[0] += amt - c[0]; b[3] += (amt - c[0]) * g
-                elif g <= cur_max:
-                    b[1] += amt; b[4] += amt * g
+                    if c[0] < amt and g > 0:
+                        d = amt - c[0]
+                        b["v"][0] += d; b["v"][3] += d * g
+                        b["h"].setdefault(str(_bin(g)), [0.0, 0.0])[0] += d          # kesin alim, bu fiyat diliminde
+                elif g <= cur_max and g > 0:
+                    b["v"][1] += amt; b["v"][4] += amt * g
+                    b["h"].setdefault(str(_bin(g)), [0.0, 0.0])[1] += amt             # alindi VEYA iptal
                 # g > cur_max: pencereden fiyat yuzunden dustu, sayilmaz
             for oid, (amt, g) in cur.items():
                 if oid not in prev and g <= prev_max:
-                    b[2] += amt
-            _b_add(st["fine"].setdefault(str(int(ts // FINE_SEC)), [0.0] * 5), b)
+                    b["v"][2] += amt
+            _b_add(st["fine"].setdefault(str(int(ts // FINE_SEC)), _new_b()), b, 8)
         st["prev"], st["prev_ts"] = cur, ts
         st["snaps"] += 1
         _act_compact(st, ts)
@@ -678,14 +700,23 @@ def _scan_update(key, offers, ts):
         s.update(ts=ts, ask=ask, n=n)
 
 
-def _sum_window(st, now, hrs):
+def _sum_window(st, now, hrs, want_hist=False):
     lo = now - hrs * 3600
-    tot = [0.0] * 5
+    v, h, hours = [0.0] * 5, {}, set()
     for tier, size in (("fine", FINE_SEC), ("hour", 3600), ("day", 86400)):
         for k, b in st[tier].items():
-            if int(k) * size >= lo:
-                _b_add(tot, b)
-    return tot
+            start = int(k) * size
+            if start >= lo:
+                for i in range(5):
+                    v[i] += b["v"][i]
+                if b["v"][0] > 0 and tier != "day":
+                    hours.add(start // 3600)                # satis gorulen farkli saat sayisi (tek seferlik iri alim ayirt edilsin)
+                if want_hist:
+                    for bk, (p, g) in b["h"].items():
+                        d = h.setdefault(bk, [0.0, 0.0])
+                        d[0] += p
+                        d[1] += g
+    return v, h, len(hours)
 
 
 def _act_summary(now):
@@ -696,11 +727,15 @@ def _act_summary(now):
             res = {"snaps": st["snaps"], "first_ts": st["first_ts"], "last_ts": st["prev_ts"],
                    "interval": st["interval"], "ask": s.get("ask"), "ema": s.get("ema"), "n": s.get("n")}
             for label, hrs in (("h1", 1), ("h6", 6), ("h24", 24), ("d7", 168), ("d30", 720)):
-                p, g, l, pv, gv = _sum_window(st, now, hrs)
-                res[label] = {"min": round(p, 1), "max": round(p + g, 1), "listed": round(l, 1),
-                              "hours": round(min(hrs, max(0.0, (now - st["first_ts"]) / 3600.0)), 2),
-                              "avg_p": round(pv / p, 4) if p > 0 else None,
-                              "avg_all": round((pv + gv) / (p + g), 4) if (p + g) > 0 else None}
+                want = label in ("h6", "h24", "d7")
+                (p, g, l, pv, gv), hist, ha = _sum_window(st, now, hrs, want)
+                w = {"min": round(p, 1), "max": round(p + g, 1), "listed": round(l, 1),
+                     "hours": round(min(hrs, max(0.0, (now - st["first_ts"]) / 3600.0)), 2),
+                     "avg_p": round(pv / p, 4) if p > 0 else None,
+                     "avg_all": round((pv + gv) / (p + g), 4) if (p + g) > 0 else None, "ha": ha}
+                if want:
+                    w["hist"] = {k: [round(x[0], 1), round(x[1], 1)] for k, x in hist.items() if x[0] + x[1] >= 0.5}
+                res[label] = w
             out[key] = res
     return out
 
@@ -708,7 +743,7 @@ def _act_summary(now):
 def _act_save():
     try:
         with _act_lock:
-            data = {"v": 2, "watch": dict(_watch), "scan": dict(_scan),
+            data = {"v": 3, "watch": dict(_watch), "scan": dict(_scan),
                     "act": {k: {"prev": {str(i): list(v) for i, v in (st["prev"] or {}).items()},
                                 "prev_ts": st["prev_ts"], "first_ts": st["first_ts"], "snaps": st["snaps"],
                                 "interval": st["interval"], "fine": st["fine"], "hour": st["hour"],
@@ -725,7 +760,7 @@ def _act_load():
     try:
         with open(ACT_FILE) as f:
             data = _json.load(f)
-        if data.get("v") != 2:
+        if data.get("v") not in (2, 3):
             return
         with _act_lock:
             _watch.update(data.get("watch") or {})
@@ -734,12 +769,16 @@ def _act_load():
                 _act[k] = {"prev": {int(i): tuple(v) for i, v in st["prev"].items()},
                            "prev_ts": st["prev_ts"], "first_ts": st["first_ts"], "snaps": st["snaps"],
                            "interval": st.get("interval", ACT_INTERVAL),
-                           "fine": st["fine"], "hour": st["hour"], "day": st["day"]}
+                           "fine": _fix_b(st["fine"]), "hour": _fix_b(st["hour"]), "day": _fix_b(st["day"])}
         print(f"[HAREKET] diskten yuklendi: {len(_act)} defter, {len(_scan)} tarama kaydi.")
     except FileNotFoundError:
         pass
     except Exception as e:
         print(f"[HAREKET] yukleme hatasi: {e}")
+
+
+def _fix_b(d):
+    return {k: (b if isinstance(b, dict) else {"v": list(b), "h": {}}) for k, b in d.items()}   # eski liste kovalar
 
 
 def _act_tracked():
@@ -862,6 +901,95 @@ def market_watch():
 
 if ACT_ENABLED:
     threading.Thread(target=_act_loop, daemon=True).start()
+
+
+# ============ DEFTER MERKEZI (cihazlar/tarayicilar arasi esitleme) ============
+# Tampermonkey maliyet defteri (parti listesi + toplam istatistikler; kucuk bir JSON) burada TEK kopya olarak
+# tutulur; boylece farkli tarayici/cihazlar ayni defteri gorur. Pazardan yakalanan alislar da once buraya
+# yazilir (/ledger/buy), hangi cihaz depoyu once acarsa deftere isler.
+# Render ucretsiz planda disk silinebilir: bu yuzden her istemci defterin YEREL kopyasini da saklar ve
+# sunucu bos donerse kendi kopyasini geri yukler. Sunucuda ham gecmis tutulmaz, tek bir guncel defter durur.
+LEDGER_FILE = os.environ.get("LEDGER_FILE", "/tmp/erp_ledger.json")
+LEDGER_MAX_BYTES = 400 * 1024
+LEDGER_MAX_BUYS = 300
+_ledger = {"version": 0, "ledger": None, "buys": []}
+_ledger_lock = threading.Lock()
+
+
+def _ledger_save():
+    try:
+        tmp = LEDGER_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            _json.dump(_ledger, f)
+        os.replace(tmp, LEDGER_FILE)
+    except Exception as e:
+        print(f"[DEFTER] kayit hatasi: {e}")
+
+
+def _ledger_load():
+    try:
+        with open(LEDGER_FILE) as f:
+            d = _json.load(f)
+        with _ledger_lock:
+            _ledger.update(version=int(d.get("version", 0)), ledger=d.get("ledger"), buys=list(d.get("buys") or []))
+        print(f"[DEFTER] diskten yuklendi: surum {_ledger['version']}, {len(_ledger['buys'])} bekleyen alis.")
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        print(f"[DEFTER] yukleme hatasi: {e}")
+
+
+_ledger_load()
+
+
+@app.route('/ledger', methods=['GET', 'PUT'])
+def ledger_endpoint():
+    if not _check_api_secret():
+        return jsonify({"error": "unauthorized"}), 401
+    if request.method == 'GET':
+        with _ledger_lock:
+            return jsonify(dict(_ledger))
+    body = request.get_json(force=True, silent=True) or {}
+    data = body.get("ledger")
+    if not isinstance(data, dict):
+        return jsonify({"error": "ledger gerekli"}), 400
+    if len(_json.dumps(data)) > LEDGER_MAX_BYTES:
+        return jsonify({"error": "defter cok buyuk"}), 413
+    try:
+        base = int(body.get("base_version", -1))
+    except (TypeError, ValueError):
+        base = -1
+    with _ledger_lock:
+        if base != _ledger["version"]:          # baska cihaz araya girdi: istemci yeniden ceker
+            return jsonify(dict(_ledger, conflict=True)), 409
+        consumed = set(str(x) for x in (body.get("consumed") or []))
+        _ledger["ledger"] = data
+        _ledger["version"] += 1
+        _ledger["buys"] = [b for b in _ledger["buys"] if str(b.get("id")) not in consumed]
+        _ledger_save()
+        return jsonify({"version": _ledger["version"]})
+
+
+@app.route('/ledger/buy', methods=['POST'])
+def ledger_buy():
+    if not _check_api_secret():
+        return jsonify({"error": "unauthorized"}), 401
+    b = request.get_json(force=True, silent=True) or {}
+    try:
+        item = {"id": str(b["id"])[:64], "key": str(b["key"]), "qty": float(b["qty"]),
+                "cost": float(b["cost"]), "t": float(b.get("t") or time.time() * 1000)}
+        ok = item["qty"] > 0 and item["cost"] > 0 and len(item["key"].split(":")) == 2 \
+            and all(x.isdigit() for x in item["key"].split(":"))
+    except (KeyError, TypeError, ValueError):
+        ok = False
+    if not ok:
+        return jsonify({"error": "gecersiz alis"}), 400
+    with _ledger_lock:
+        if not any(x.get("id") == item["id"] for x in _ledger["buys"]):
+            _ledger["buys"].append(item)
+            del _ledger["buys"][:-LEDGER_MAX_BUYS]
+            _ledger_save()
+    return jsonify({"ok": True})
 
 
 # Thread'i modul seviyesinde baslatiyoruz - Render'da "gunicorn app:app" gibi
