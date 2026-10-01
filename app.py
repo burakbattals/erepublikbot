@@ -593,7 +593,17 @@ WATCH_INTERVAL = max(300, int(os.environ.get("WATCH_INTERVAL_SEC", "600")))
 MAX_WATCH = max(1, int(os.environ.get("MAX_WATCH", "10")))
 SCAN_ENABLED = os.environ.get("SCAN_ENABLED", "1") == "1"
 SCAN_GAP = max(10, int(os.environ.get("SCAN_GAP_SEC", "20")))
-ASK_MIN_UNITS = int(os.environ.get("ASK_MIN_UNITS", "10"))
+ASK_MIN_UNITS = int(os.environ.get("ASK_MIN_UNITS", "10"))      # bilinmeyen urunler icin varsayilan
+# Urun basina "en ucuz teklif" sayilmak icin gereken en az adet (tek-iki adetlik toz teklifler hammaddede yok sayilir,
+# ev/hava silahi gibi az adetli urunlerde 1 adetlik teklif de gercek tekliftir). ENV: ASK_MIN_MAP="7:1=10,4:1=1"
+ASK_MIN_MAP = {"7:1": 10, "12:1": 10, "17:1": 10, "24:1": 10, "4:1": 1, "23:5": 1, "2:7": 5}
+for _kv in os.environ.get("ASK_MIN_MAP", "").split(","):
+    if "=" in _kv:
+        _k, _v = _kv.split("=", 1)
+        try:
+            ASK_MIN_MAP[_k.strip()] = int(_v)
+        except ValueError:
+            pass
 ACT_ITEMS = [x.strip() for x in os.environ.get(
     "ACTIVITY_ITEMS", "7:1,12:1,17:1,24:1,4:1,23:5,2:7").split(",") if x.strip()]
 SCAN_COUNTRIES = [x.strip() for x in os.environ.get(
@@ -633,11 +643,11 @@ def _bin(price):
 
 
 def _new_b():
-    return {"v": [0.0] * 5, "h": {}}   # v=[kesin adet, kaybolan adet, yeni ilan, kesin deger, kaybolan deger]; h={dilim:[kesin, kaybolan]}
+    return {"v": [0.0] * 6, "h": {}}   # v=[kesin adet, kaybolan adet, yeni ilan, kesin deger, kaybolan deger, alim olayi sayisi]; h={dilim:[kesin, kaybolan]}
 
 
 def _b_add(dst, src, cap=None):
-    for i in range(5):
+    for i in range(len(src["v"])):
         dst["v"][i] += src["v"][i]
     for k, (p, g) in src["h"].items():
         d = dst["h"].setdefault(k, [0.0, 0.0])
@@ -670,8 +680,19 @@ def _act_apply(key, offers, ts, interval):
             continue
     with _act_lock:
         st = _act.setdefault(key, {"prev": None, "prev_ts": 0.0, "first_ts": ts, "snaps": 0,
-                                   "interval": interval, "fine": {}, "hour": {}, "day": {}})
+                                   "interval": interval, "fine": {}, "hour": {}, "day": {}, "top": None})
         st["interval"] = interval
+        # EN UCUZ teklif (urune ozgu "toz" siniri uzerindeki en dusuk fiyat): degismeden ne kadar suredir duruyor?
+        # Alicilar once en ucuzu alir; en ucuz teklif saatlerdir ayni adetle duruyorsa o fiyattan alici yok demektir.
+        minu, best = _ask_min(key), None
+        for oid, (amt, g) in cur.items():
+            if g > 0 and (best is None or (amt < minu, g) < (best[1] < minu, best[2])):
+                best = (oid, amt, g)
+        old = st.get("top")
+        if best is None:
+            st["top"] = None
+        elif not (old and old["id"] == best[0] and abs(old["amt"] - best[1]) < 1e-9):
+            st["top"] = {"id": best[0], "amt": best[1], "g": best[2], "since": ts}     # yeni teklif ya da adedi azaldi (alim oldu)
         prev, prev_ts = st["prev"], st["prev_ts"]
         if prev and 0 < ts - prev_ts <= interval * 3:
             cur_max = float("inf") if len(cur) < ACT_WINDOW else max(g for _, g in cur.values())
@@ -682,7 +703,7 @@ def _act_apply(key, offers, ts, interval):
                 if c is not None:
                     if c[0] < amt and g > 0:
                         d = amt - c[0]
-                        b["v"][0] += d; b["v"][3] += d * g
+                        b["v"][0] += d; b["v"][3] += d * g; b["v"][5] += 1
                         b["h"].setdefault(str(_bin(g)), [0.0, 0.0])[0] += d          # kesin alim, bu fiyat diliminde
                 elif g <= cur_max and g > 0:
                     b["v"][1] += amt; b["v"][4] += amt * g
@@ -697,7 +718,8 @@ def _act_apply(key, offers, ts, interval):
         _act_compact(st, ts)
 
 
-def _ask_of(offers):
+def _ask_of(offers, minu=None):
+    minu = ASK_MIN_UNITS if minu is None else minu
     best = anyp = None
     for o in offers:
         try:
@@ -706,13 +728,13 @@ def _ask_of(offers):
             continue
         if anyp is None or g < anyp:
             anyp = g
-        if amt >= ASK_MIN_UNITS and (best is None or g < best):
+        if amt >= minu and (best is None or g < best):
             best = g
     return best if best is not None else anyp
 
 
 def _scan_update(key, offers, ts):
-    ask = _ask_of(offers)
+    ask = _ask_of(offers, _ask_min(key))
     n = len(offers)
     with _act_lock:
         s = _scan.get(key)
@@ -730,12 +752,12 @@ def _scan_update(key, offers, ts):
 
 def _sum_window(st, now, hrs, want_hist=False):
     lo = now - hrs * 3600
-    v, h, hours = [0.0] * 5, {}, set()
+    v, h, hours = [0.0] * 6, {}, set()
     for tier, size in (("fine", FINE_SEC), ("hour", 3600), ("day", 86400)):
         for k, b in st[tier].items():
             start = int(k) * size
             if start >= lo:
-                for i in range(5):
+                for i in range(len(b["v"])):
                     v[i] += b["v"][i]
                 if b["v"][0] > 0 and tier != "day":
                     hours.add(start // 3600)                # satis gorulen farkli saat sayisi (tek seferlik iri alim ayirt edilsin)
@@ -756,14 +778,16 @@ def _act_summary(now):
                    "interval": st["interval"], "ask": s.get("ask"), "ema": s.get("ema"), "n": s.get("n")}
             for label, hrs in (("h1", 1), ("h6", 6), ("h24", 24), ("d7", 168), ("d30", 720)):
                 want = label in ("h6", "h24", "d7")
-                (p, g, l, pv, gv), hist, ha = _sum_window(st, now, hrs, want)
+                (p, g, l, pv, gv, nev), hist, ha = _sum_window(st, now, hrs, want)
                 w = {"min": round(p, 1), "max": round(p + g, 1), "listed": round(l, 1),
                      "hours": round(min(hrs, max(0.0, (now - st["first_ts"]) / 3600.0)), 2),
                      "avg_p": round(pv / p, 4) if p > 0 else None,
-                     "avg_all": round((pv + gv) / (p + g), 4) if (p + g) > 0 else None, "ha": ha}
+                     "avg_all": round((pv + gv) / (p + g), 4) if (p + g) > 0 else None, "ha": ha, "n": int(nev)}
                 if want:
                     w["hist"] = {k: [round(x[0], 1), round(x[1], 1)] for k, x in hist.items() if x[0] + x[1] >= 0.5}
                 res[label] = w
+            t = st.get("top")
+            res["top"] = {"g": t["g"], "amt": t["amt"], "age_h": round((now - t["since"]) / 3600.0, 2)} if t else None
             out[key] = res
     return out
 
@@ -775,7 +799,7 @@ def _act_save():
                     "act": {k: {"prev": {str(i): list(v) for i, v in (st["prev"] or {}).items()},
                                 "prev_ts": st["prev_ts"], "first_ts": st["first_ts"], "snaps": st["snaps"],
                                 "interval": st["interval"], "fine": st["fine"], "hour": st["hour"],
-                                "day": st["day"]} for k, st in _act.items()}}
+                                "day": st["day"], "top": st.get("top")} for k, st in _act.items()}}
         tmp = ACT_FILE + ".tmp"
         with open(tmp, "w") as f:
             _json.dump(data, f)
@@ -797,7 +821,7 @@ def _act_load():
                 _act[k] = {"prev": {int(i): tuple(v) for i, v in st["prev"].items()},
                            "prev_ts": st["prev_ts"], "first_ts": st["first_ts"], "snaps": st["snaps"],
                            "interval": st.get("interval", ACT_INTERVAL),
-                           "fine": _fix_b(st["fine"]), "hour": _fix_b(st["hour"]), "day": _fix_b(st["day"])}
+                           "fine": _fix_b(st["fine"]), "hour": _fix_b(st["hour"]), "day": _fix_b(st["day"]), "top": st.get("top")}
         print(f"[HAREKET] diskten yuklendi: {len(_act)} defter, {len(_scan)} tarama kaydi.")
     except FileNotFoundError:
         pass
@@ -805,8 +829,17 @@ def _act_load():
         print(f"[HAREKET] yukleme hatasi: {e}")
 
 
+def _ask_min(key):
+    return ASK_MIN_MAP.get(key.split(":", 1)[1], ASK_MIN_UNITS)
+
+
 def _fix_b(d):
-    return {k: (b if isinstance(b, dict) else {"v": list(b), "h": {}}) for k, b in d.items()}   # eski liste kovalar
+    out = {}
+    for k, b in d.items():
+        b = b if isinstance(b, dict) else {"v": list(b), "h": {}}   # eski liste kovalar
+        b["v"] = list(b["v"]) + [0.0] * (6 - len(b["v"]))             # eski kovalar: alim-olayi sayaci yoktu
+        out[k] = b
+    return out
 
 
 def _act_tracked():
