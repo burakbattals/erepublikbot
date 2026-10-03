@@ -581,7 +581,8 @@ def bot_loop():
 # Veri sakligi sinirli: 12 saat 10 dk'lik, 7 gun saatlik, 30 gun gunluk TOPLAM; sonra silinir.
 # Render ENV (hepsi opsiyonel):
 #   ACTIVITY_ENABLED=1, ACTIVITY_INTERVAL_SEC=180 (global), WATCH_INTERVAL_SEC=600 (izlenen ulkeler),
-#   MAX_WATCH=10, SCAN_ENABLED=1, SCAN_GAP_SEC=20 (taramada istekler arasi sn),
+#   MAX_WATCH=60, SCAN_ENABLED=1, SCAN_GAP_SEC=8 (taramada istekler arasi sn),
+#   REQ_COST_SEC=2.5 (tek istegin ortalama maliyeti), WATCH_UTIL=0.75 (izlemeye ayrilacak zaman payi; kalani tarama icin),
 #   ACTIVITY_ITEMS="7:1,12:1,17:1,24:1,4:1,23:5,2:7", SCAN_COUNTRIES="1,9,10,...", ASK_MIN_UNITS=10
 import math
 import json as _json
@@ -590,9 +591,11 @@ ACT_ENABLED = os.environ.get("ACTIVITY_ENABLED", "1") == "1"
 ACT_API = "https://service.erepublik.tools/api/v1/market/item/{c}/{i}/{q}"
 ACT_INTERVAL = max(120, int(os.environ.get("ACTIVITY_INTERVAL_SEC", "180")))
 WATCH_INTERVAL = max(300, int(os.environ.get("WATCH_INTERVAL_SEC", "600")))
-MAX_WATCH = max(1, int(os.environ.get("MAX_WATCH", "10")))
+MAX_WATCH = max(1, int(os.environ.get("MAX_WATCH", "60")))
+REQ_COST = max(1.0, float(os.environ.get("REQ_COST_SEC", "2.5")))     # dongu 1,5 sn bekler + HTTP suresi
+WATCH_UTIL = min(0.95, max(0.3, float(os.environ.get("WATCH_UTIL", "0.75"))))
 SCAN_ENABLED = os.environ.get("SCAN_ENABLED", "1") == "1"
-SCAN_GAP = max(10, int(os.environ.get("SCAN_GAP_SEC", "20")))
+SCAN_GAP = max(3, int(os.environ.get("SCAN_GAP_SEC", "8")))
 ASK_MIN_UNITS = int(os.environ.get("ASK_MIN_UNITS", "10"))      # bilinmeyen urunler icin varsayilan
 # Urun basina "en ucuz teklif" sayilmak icin gereken en az adet (tek-iki adetlik toz teklifler hammaddede yok sayilir,
 # ev/hava silahi gibi az adetli urunlerde 1 adetlik teklif de gercek tekliftir). ENV: ASK_MIN_MAP="7:1=10,4:1=1"
@@ -617,7 +620,7 @@ FINE_SEC, FINE_KEEP = 600, 12 * 3600
 HOUR_KEEP, DAY_KEEP = 7 * 86400, 30 * 86400
 _act = {}                  # "ulke:sanayi:kalite" -> durum
 _scan = {}                 # "ulke:sanayi:kalite" -> {"ts","ask","ema","n"}
-_watch = {"countries": [], "skip": [], "ts": 0.0}
+_watch = {"countries": [], "skip": [], "all": [], "ts": 0.0}
 _act_lock = threading.Lock()
 _act_pause_until = 0.0
 _act_stats = {"global_ok": 0, "global_err": 0, "country_ok": 0, "country_err": 0,
@@ -842,19 +845,30 @@ def _fix_b(d):
     return out
 
 
+def _watch_interval(n_countries):
+    """Izlenen ulke sayisi arttikca aralik otomatik uzar: tek is parcacigi tum istekleri yetistirebilsin,
+    uzun gecikme satis tahminini bozmasin. 10 ulkede = WATCH_INTERVAL (600 sn), 60 ulkede ~ 27 dk."""
+    n_keys = n_countries * len(ACT_ITEMS)
+    glob = len(ACT_ITEMS) * REQ_COST / ACT_INTERVAL              # global defterlerin kapladigi zaman payi
+    free = max(0.2, WATCH_UTIL - glob)
+    return max(WATCH_INTERVAL, int(n_keys * REQ_COST / free))
+
+
 def _act_tracked():
     out = [(f"0:{it}", ACT_INTERVAL) for it in ACT_ITEMS]
     with _act_lock:
         ws = list(_watch["countries"])[:MAX_WATCH]
+    itv = _watch_interval(len(ws))
     for c in ws:
-        out += [(f"{c}:{it}", WATCH_INTERVAL) for it in ACT_ITEMS]
+        out += [(f"{c}:{it}", itv) for it in ACT_ITEMS]
     return out
 
 
 def _scan_keys():
     with _act_lock:
         skip = set(_watch["skip"]) | set(_watch["countries"]) | {"0"}
-    return [f"{c}:{it}" for c in SCAN_COUNTRIES if c not in skip for it in ACT_ITEMS]
+        extra = [c for c in (_watch.get("all") or []) if c not in SCAN_COUNTRIES]
+    return [f"{c}:{it}" for c in (SCAN_COUNTRIES + extra) if c not in skip for it in ACT_ITEMS]
 
 
 def _act_fetch(key, hdr):
@@ -961,10 +975,14 @@ def market_watch():
         with _act_lock:
             _watch["countries"] = ids(body.get("countries"), MAX_WATCH)
             _watch["skip"] = ids(body.get("skip"), 100)
+            if body.get("all") is not None:
+                _watch["all"] = ids(body.get("all"), 300)      # oyundaki TUM ulkeler: SCAN_COUNTRIES'te olmayanlar da taranir
             _watch["ts"] = time.time()
         _act_save()
     with _act_lock:
-        return jsonify(dict(_watch, max=MAX_WATCH))
+        snap = dict(_watch)
+    n_scan = len(_scan_keys()) if SCAN_ENABLED else 0              # kilit dışında (kilit yeniden girilemez)
+    return jsonify(dict(snap, max=MAX_WATCH, interval=_watch_interval(min(len(snap["countries"]), MAX_WATCH)), scan_keys=n_scan))
 
 
 if ACT_ENABLED:
