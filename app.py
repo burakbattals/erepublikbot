@@ -646,16 +646,18 @@ def _bin(price):
 
 
 def _new_b():
-    return {"v": [0.0] * 6, "h": {}}   # v=[kesin adet, kaybolan adet, yeni ilan, kesin deger, kaybolan deger, alim olayi sayisi]; h={dilim:[kesin, kaybolan]}
+    return {"v": [0.0] * 6, "h": {}}   # v=[kesin adet, kaybolan adet, yeni ilan, kesin deger, kaybolan deger, alim olayi sayisi]; h={dilim:[kesin, kaybolan, muhtemel alim (kaybolanin alinmis olma ihtimali yuksek kismi)]}
 
 
 def _b_add(dst, src, cap=None):
     for i in range(len(src["v"])):
         dst["v"][i] += src["v"][i]
-    for k, (p, g) in src["h"].items():
-        d = dst["h"].setdefault(k, [0.0, 0.0])
-        d[0] += p
-        d[1] += g
+    for k, x in src["h"].items():
+        d = dst["h"].setdefault(k, [0.0, 0.0, 0.0])
+        while len(d) < 3:
+            d.append(0.0)
+        for i in range(min(3, len(x))):                                # eski kovalar 2 elemanlidir
+            d[i] += x[i]
     if cap is not None and len(dst["h"]) > cap:       # boyut sabit kalsin: en kucuk hacimli dilimleri at (0 = hepsini at)
         dst["h"] = dict(sorted(dst["h"].items(), key=lambda kv: -(kv[1][0] + kv[1][1]))[:cap])
 
@@ -701,16 +703,28 @@ def _act_apply(key, offers, ts, interval):
             cur_max = float("inf") if len(cur) < ACT_WINDOW else max(g for _, g in cur.values())
             prev_max = float("inf") if len(prev) < ACT_WINDOW else max(g for _, g in prev.values())
             b = _new_b()
+            # ALIM TAHMINI: alicilar en ucuzdan alir. Kaybolan bir teklifin fiyati, DEGISMEDEN kalan en ucuz teklifin fiyatindan
+            # dusukse (ya da esitse) buyuk ihtimalle alinmistir; ucuzu atlayip pahaliyi alan olmaz. Ayni adetle yeniden ilan
+            # edilmis (fiyat degistirme) teklifler iptal sayilir. Ikisi de tutucu: suphede alim sayilmaz.
+            untouched = [g0 for oid0, (amt0, g0) in prev.items() if g0 > 0 and oid0 in cur and cur[oid0][0] >= amt0 - 1e-9]
+            floor_u = min(untouched) if untouched else float("inf")
+            new_amts = [a0 for oid0, (a0, g0) in cur.items() if oid0 not in prev]
             for oid, (amt, g) in prev.items():
                 c = cur.get(oid)
                 if c is not None:
                     if c[0] < amt and g > 0:
                         d = amt - c[0]
                         b["v"][0] += d; b["v"][3] += d * g; b["v"][5] += 1
-                        b["h"].setdefault(str(_bin(g)), [0.0, 0.0])[0] += d          # kesin alim, bu fiyat diliminde
+                        b["h"].setdefault(str(_bin(g)), [0.0, 0.0, 0.0])[0] += d    # kesin alim, bu fiyat diliminde
                 elif g <= cur_max and g > 0:
                     b["v"][1] += amt; b["v"][4] += amt * g
-                    b["h"].setdefault(str(_bin(g)), [0.0, 0.0])[1] += amt             # alindi VEYA iptal
+                    hb = b["h"].setdefault(str(_bin(g)), [0.0, 0.0, 0.0])
+                    hb[1] += amt                                                       # alindi VEYA iptal
+                    rep_i = next((i for i, a0 in enumerate(new_amts) if abs(a0 - amt) < 1e-9), None)
+                    if rep_i is not None:
+                        new_amts.pop(rep_i)                                            # ayni adetle yeniden ilan: fiyat degistirme, alim degil
+                    elif g <= floor_u + 1e-9:
+                        hb[2] += amt                                                   # ucuzlar da gitmis: buyuk ihtimalle alindi
                 # g > cur_max: pencereden fiyat yuzunden dustu, sayilmaz
             for oid, (amt, g) in cur.items():
                 if oid not in prev and g <= prev_max:
@@ -765,10 +779,10 @@ def _sum_window(st, now, hrs, want_hist=False):
                 if b["v"][0] > 0 and tier != "day":
                     hours.add(start // 3600)                # satis gorulen farkli saat sayisi (tek seferlik iri alim ayirt edilsin)
                 if want_hist:
-                    for bk, (p, g) in b["h"].items():
-                        d = h.setdefault(bk, [0.0, 0.0])
-                        d[0] += p
-                        d[1] += g
+                    for bk, x in b["h"].items():
+                        d = h.setdefault(bk, [0.0, 0.0, 0.0])
+                        for i in range(min(3, len(x))):
+                            d[i] += x[i]
     return v, h, len(hours)
 
 
@@ -787,7 +801,7 @@ def _act_summary(now):
                      "avg_p": round(pv / p, 4) if p > 0 else None,
                      "avg_all": round((pv + gv) / (p + g), 4) if (p + g) > 0 else None, "ha": ha, "n": int(nev)}
                 if want:
-                    w["hist"] = {k: [round(x[0], 1), round(x[1], 1)] for k, x in hist.items() if x[0] + x[1] >= 0.5}
+                    w["hist"] = {k: [round(x[0], 1), round(x[1], 1), round(x[2], 1)] for k, x in hist.items() if x[0] + x[1] >= 0.5}
                 res[label] = w
             t = st.get("top")
             res["top"] = {"g": t["g"], "amt": t["amt"], "age_h": round((now - t["since"]) / 3600.0, 2)} if t else None
