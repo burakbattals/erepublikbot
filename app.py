@@ -305,7 +305,7 @@ def bot_loop():
         "Bilet Q5|https://erepublik.tools/en/marketplace/items/0/3/5/offers|50|5|0,"
         "Ev Q1|https://erepublik.tools/en/marketplace/items/0/4/1/offers|0|5|0,"
         "Ev Q2|https://erepublik.tools/en/marketplace/items/0/4/2/offers|0|5|0,"
-        "Ev Q3|https://erepublik.tools/en/marketplace/items/0/4/3/offers|0|25|0,"
+        "Ev Q3|https://erepublik.tools/en/marketplace/items/0/4/3/offers|0|100|0,"
         "Ev Q4|https://erepublik.tools/en/marketplace/items/0/4/4/offers|0|50|0,"
         "Ev Q5|https://erepublik.tools/en/marketplace/items/0/4/5/offers|0|50|0,"
         "Altin (Gold)|https://erepublik.tools/en/marketplace/monetary-market/gold/offers|1|5|0"
