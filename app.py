@@ -305,9 +305,9 @@ def bot_loop():
         "Bilet Q5|https://erepublik.tools/en/marketplace/items/0/3/5/offers|50|5|0,"
         "Ev Q1|https://erepublik.tools/en/marketplace/items/0/4/1/offers|0|5|0,"
         "Ev Q2|https://erepublik.tools/en/marketplace/items/0/4/2/offers|0|5|0,"
-        "Ev Q3|https://erepublik.tools/en/marketplace/items/0/4/3/offers|0|5|0,"
-        "Ev Q4|https://erepublik.tools/en/marketplace/items/0/4/4/offers|0|15|0,"
-        "Ev Q5|https://erepublik.tools/en/marketplace/items/0/4/5/offers|0|15|0,"
+        "Ev Q3|https://erepublik.tools/en/marketplace/items/0/4/3/offers|0|25|0,"
+        "Ev Q4|https://erepublik.tools/en/marketplace/items/0/4/4/offers|0|50|0,"
+        "Ev Q5|https://erepublik.tools/en/marketplace/items/0/4/5/offers|0|50|0,"
         "Altin (Gold)|https://erepublik.tools/en/marketplace/monetary-market/gold/offers|1|5|0"
     )
     items_raw = os.environ.get("ITEM_WATCH_URLS", DEFAULT_ITEMS)
@@ -315,6 +315,17 @@ def bot_loop():
     ITEM_MIN_QTY = {}    # label -> minimum miktar
     ITEM_DROP_PCT = {}   # label -> dususte alarm esigi (%)
     ITEM_ENERGY = {}     # label -> enerji karsiligi (0 = yok, mutlak kontrol atlanir)
+    # MUTLAK KAR FIYATI (cc): fiyat bu degerin ALTINA inince bildirim gelir (yuzde dususune bakmaz).
+    # Hesap: ev basina 8 gunde mesai kazanci 8x7800=62.400 cc + enerji (3.840 enerji / 4000 = 0,96 madalya x 10 gold x 1900 cc = 18.240 cc)
+    # => kar-basabas = 80.640 cc (4000 enerji/madalya). Kullanici Ev Q3 icin 85.000 sectı. ENV ile degistir: ITEM_MAX_PRICE="Ev Q3=85000"
+    ITEM_MAX_PRICE = {}
+    for _p in os.environ.get("ITEM_MAX_PRICE", "Ev Q3=85000").split(","):
+        if "=" in _p:
+            _k, _v = _p.rsplit("=", 1)
+            try:
+                ITEM_MAX_PRICE[_k.strip()] = float(_v)
+            except ValueError:
+                pass
 
     def _add_item(label, url, min_qty, drop_pct, energy):
         label = label.strip()
@@ -447,6 +458,7 @@ def bot_loop():
 
     # ---------------- URUN FIYATLARI ----------------
     last_lowest_price = {}  # label -> fiyat
+    abs_alerted = {}        # label -> en son mutlak-fiyat alarminda bildirilen fiyat
     good_value_state = {}   # label -> su an "iyi fiyat" esigi altinda mi (spam onlemek icin)
 
     def check_items():
@@ -494,6 +506,20 @@ def bot_loop():
                                f"Link: {link}")
                         send_tg(msg)
                         print(f"FIYAT ALARMI GONDERILDI: {label} -> {price}")
+
+                # --- MUTLAK KAR FIYATI ALARMI ---
+                max_price = ITEM_MAX_PRICE.get(label)
+                if max_price:
+                    if price <= max_price:
+                        prev_alert = abs_alerted.get(label)
+                        if prev_alert is None or price <= prev_alert * 0.95:     # ilk kez veya bildirilenden en az %5 daha ucuz
+                            send_tg(f"KARLI FIYAT: {label}\n"
+                                    f"En dusuk: {price:.2f} (kar esigi: {max_price:.0f})\n"
+                                    f"Link: {link}")
+                            print(f"KAR ALARMI GONDERILDI: {label} -> {price}")
+                            abs_alerted[label] = price
+                    else:
+                        abs_alerted.pop(label, None)                              # esigin ustune cikti: bir sonraki inise hazir
 
                 last_lowest_price[label] = price
 
