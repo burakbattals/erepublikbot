@@ -609,9 +609,96 @@ def bot_loop():
 #   ACTIVITY_ENABLED=1, ACTIVITY_INTERVAL_SEC=180 (global), WATCH_INTERVAL_SEC=600 (izlenen ulkeler),
 #   MAX_WATCH=60, SCAN_ENABLED=1, SCAN_GAP_SEC=8 (taramada istekler arasi sn),
 #   REQ_COST_SEC=2.5 (tek istegin ortalama maliyeti), WATCH_UTIL=0.75 (izlemeye ayrilacak zaman payi; kalani tarama icin),
-#   ACTIVITY_ITEMS="7:1,12:1,17:1,24:1,4:1,23:5,2:7", SCAN_COUNTRIES="1,9,10,...", ASK_MIN_UNITS=10
+#   ACTIVITY_ITEMS="7:1,12:1,17:1,24:1,4:1,4:2,4:3,23:5,2:7", SCAN_COUNTRIES="1,9,10,...", ASK_MIN_UNITS=10
 import math
 import json as _json
+import gzip
+import base64
+import hashlib
+
+# ---- BULUT YEDEK (GitHub Gist) ----------------------------------------------------------------------
+# Render ucretsiz planda /tmp her yeniden baslatma/deploy'da silinir (hareket verisi ve defter gider).
+# GIST_ID + GIST_TOKEN tanimliysa dosyalar (sikistirilmis) gizli bir Gist'e yedeklenir; sunucu acilirken yerel dosya
+# yoksa Gist'ten geri yuklenir. Kurulum: gist.github.com'da GIZLI bir gist ac (herhangi bir dosya), URL'deki kodu GIST_ID yap;
+# GitHub > Settings > Developer settings > Personal access tokens (classic) > sadece "gist" yetkisiyle token olustur -> GIST_TOKEN.
+# CLOUD_BACKUP_SEC=600 (en sik bu kadar sn'de bir yedek).
+GIST_ID = os.environ.get("GIST_ID", "").strip()
+GIST_TOKEN = os.environ.get("GIST_TOKEN", "").strip()
+CLOUD_BACKUP_SEC = max(120, int(os.environ.get("CLOUD_BACKUP_SEC", "600")))
+CLOUD_NAMES = {"ACT": "market_activity.json.gz.b64", "LEDGER": "erp_ledger.json.gz.b64"}
+_cloud_last = [0.0]
+_cloud_hash = {}
+_cloud_busy = threading.Lock()
+
+
+def _cloud_headers():
+    return {"Authorization": f"Bearer {GIST_TOKEN}", "Accept": "application/vnd.github+json", "User-Agent": "erep-bot"}
+
+
+def _cloud_restore(path, name):
+    """Yerel dosya yoksa Gist'ten geri yukler. Basarisizlikta sessizce gecer."""
+    if not (GIST_ID and GIST_TOKEN) or os.path.exists(path):
+        return
+    try:
+        r = requests.get(f"https://api.github.com/gists/{GIST_ID}", headers=_cloud_headers(), timeout=30)
+        if r.status_code != 200:
+            print(f"[YEDEK] gist okunamadi: {r.status_code}")
+            return
+        f = (r.json().get("files") or {}).get(name)
+        if not f:
+            return
+        content = f.get("content")
+        if f.get("truncated") or content is None:
+            content = requests.get(f["raw_url"], headers=_cloud_headers(), timeout=60).text
+        raw = gzip.decompress(base64.b64decode(content))
+        with open(path, "wb") as fh:
+            fh.write(raw)
+        print(f"[YEDEK] {name} gist'ten geri yuklendi ({len(raw)//1024} KB).")
+    except Exception as e:
+        print(f"[YEDEK] geri yukleme hatasi: {e}")
+
+
+def _cloud_upload():
+    try:
+        files = {}
+        for key, path in (("ACT", ACT_FILE), ("LEDGER", LEDGER_FILE)):
+            if not os.path.exists(path):
+                continue
+            with open(path, "rb") as fh:
+                raw = fh.read()
+            h = hashlib.md5(raw).hexdigest()
+            if _cloud_hash.get(key) == h:
+                continue
+            files[CLOUD_NAMES[key]] = {"content": base64.b64encode(gzip.compress(raw, 6)).decode()}
+            _cloud_hash[key] = h
+        if not files:
+            return
+        r = requests.patch(f"https://api.github.com/gists/{GIST_ID}", headers=_cloud_headers(), json={"files": files}, timeout=90)
+        if r.status_code != 200:
+            for key in ("ACT", "LEDGER"):
+                _cloud_hash.pop(key, None)                  # basarisiz: bir sonraki turda yeniden dene
+            print(f"[YEDEK] yukleme basarisiz: {r.status_code} {r.text[:120]}")
+        else:
+            print(f"[YEDEK] gist'e yedeklendi: {', '.join(files)}")
+    except Exception as e:
+        _cloud_hash.clear()
+        print(f"[YEDEK] yukleme hatasi: {e}")
+    finally:
+        _cloud_busy.release()
+
+
+def _cloud_backup_async(force=False):
+    """Kayit sonrasi cagrilir; en sik CLOUD_BACKUP_SEC'de bir, ayri is parcaciginda yukler (tarama yavaslamaz)."""
+    if not (GIST_ID and GIST_TOKEN):
+        return
+    now = time.time()
+    if not force and now - _cloud_last[0] < CLOUD_BACKUP_SEC:
+        return
+    if not _cloud_busy.acquire(blocking=False):
+        return
+    _cloud_last[0] = now
+    threading.Thread(target=_cloud_upload, daemon=True).start()
+
 
 ACT_ENABLED = os.environ.get("ACTIVITY_ENABLED", "1") == "1"
 ACT_API = "https://service.erepublik.tools/api/v1/market/item/{c}/{i}/{q}"
@@ -625,7 +712,7 @@ SCAN_GAP = max(3, int(os.environ.get("SCAN_GAP_SEC", "8")))
 ASK_MIN_UNITS = int(os.environ.get("ASK_MIN_UNITS", "10"))      # bilinmeyen urunler icin varsayilan
 # Urun basina "en ucuz teklif" sayilmak icin gereken en az adet (tek-iki adetlik toz teklifler hammaddede yok sayilir,
 # ev/hava silahi gibi az adetli urunlerde 1 adetlik teklif de gercek tekliftir). ENV: ASK_MIN_MAP="7:1=10,4:1=1"
-ASK_MIN_MAP = {"7:1": 10, "12:1": 10, "17:1": 10, "24:1": 10, "4:1": 1, "23:5": 1, "2:7": 5}
+ASK_MIN_MAP = {"7:1": 10, "12:1": 10, "17:1": 10, "24:1": 10, "4:1": 1, "4:2": 1, "4:3": 1, "23:5": 1, "2:7": 5}
 for _kv in os.environ.get("ASK_MIN_MAP", "").split(","):
     if "=" in _kv:
         _k, _v = _kv.split("=", 1)
@@ -634,7 +721,7 @@ for _kv in os.environ.get("ASK_MIN_MAP", "").split(","):
         except ValueError:
             pass
 ACT_ITEMS = [x.strip() for x in os.environ.get(
-    "ACTIVITY_ITEMS", "7:1,12:1,17:1,24:1,4:1,23:5,2:7").split(",") if x.strip()]
+    "ACTIVITY_ITEMS", "7:1,12:1,17:1,24:1,4:1,4:2,4:3,23:5,2:7").split(",") if x.strip()]
 SCAN_COUNTRIES = [x.strip() for x in os.environ.get(
     "SCAN_COUNTRIES",
     "1,9,10,11,12,13,14,15,23,24,26,27,28,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,47,48,49,"
@@ -847,12 +934,14 @@ def _act_save():
         with open(tmp, "w") as f:
             _json.dump(data, f)
         os.replace(tmp, ACT_FILE)
+        _cloud_backup_async()
     except Exception as e:
         print(f"[HAREKET] kayit hatasi: {e}")
 
 
 def _act_load():
     try:
+        _cloud_restore(ACT_FILE, CLOUD_NAMES["ACT"])
         with open(ACT_FILE) as f:
             data = _json.load(f)
         if data.get("v") not in (2, 3):
@@ -1048,12 +1137,14 @@ def _ledger_save():
         with open(tmp, "w") as f:
             _json.dump(_ledger, f)
         os.replace(tmp, LEDGER_FILE)
+        _cloud_backup_async()
     except Exception as e:
         print(f"[DEFTER] kayit hatasi: {e}")
 
 
 def _ledger_load():
     try:
+        _cloud_restore(LEDGER_FILE, CLOUD_NAMES["LEDGER"])
         with open(LEDGER_FILE) as f:
             d = _json.load(f)
         with _ledger_lock:
