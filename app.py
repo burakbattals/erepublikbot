@@ -305,7 +305,7 @@ def bot_loop():
         "Bilet Q5|https://erepublik.tools/en/marketplace/items/0/3/5/offers|50|5|0,"
         "Ev Q1|https://erepublik.tools/en/marketplace/items/0/4/1/offers|0|5|0,"
         "Ev Q2|https://erepublik.tools/en/marketplace/items/0/4/2/offers|0|5|0,"
-        "Ev Q3|https://erepublik.tools/en/marketplace/items/0/4/3/offers|0|100|0,"
+        "Ev Q3|https://erepublik.tools/en/marketplace/items/0/4/3/offers|0|5|0,"
         "Ev Q4|https://erepublik.tools/en/marketplace/items/0/4/4/offers|0|50|0,"
         "Ev Q5|https://erepublik.tools/en/marketplace/items/0/4/5/offers|0|50|0,"
         "Altin (Gold)|https://erepublik.tools/en/marketplace/monetary-market/gold/offers|1|5|0"
@@ -317,9 +317,9 @@ def bot_loop():
     ITEM_ENERGY = {}     # label -> enerji karsiligi (0 = yok, mutlak kontrol atlanir)
     # MUTLAK KAR FIYATI (cc): fiyat bu degerin ALTINA inince bildirim gelir (yuzde dususune bakmaz).
     # Hesap: ev basina 8 gunde mesai kazanci 8x7800=62.400 cc + enerji (3.840 enerji / 4000 = 0,96 madalya x 10 gold x 1900 cc = 18.240 cc)
-    # => kar-basabas = 80.640 cc (4000 enerji/madalya). Kullanici Ev Q3 icin 85.000 sectı. ENV ile degistir: ITEM_MAX_PRICE="Ev Q3=85000"
+    # => kar-basabas = 80.640 cc (4000 enerji/madalya). Varsayilan KAPALI (bos). Ornek ENV ile ac: ITEM_MAX_PRICE="Ev Q3=85000"
     ITEM_MAX_PRICE = {}
-    for _p in os.environ.get("ITEM_MAX_PRICE", "Ev Q3=85000").split(","):
+    for _p in os.environ.get("ITEM_MAX_PRICE", "").split(","):
         if "=" in _p:
             _k, _v = _p.rsplit("=", 1)
             try:
