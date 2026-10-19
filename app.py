@@ -266,11 +266,19 @@ def bot_loop():
 
     # --- ZAMANLAMA (Render Environment'tan degistirilebilir) ---
     JOB_CHECK_INTERVAL = int(os.environ.get("JOB_CHECK_INTERVAL_SEC", "1800"))   # 30 dakika
-    ITEM_CHECK_INTERVAL = int(os.environ.get("ITEM_CHECK_INTERVAL_SEC", "600"))  # 10 dakika
+    ITEM_CHECK_INTERVAL = int(os.environ.get("ITEM_CHECK_INTERVAL_SEC", "120"))  # urun kontrol araligi VARSAYILANI (2 dk); urun bazinda panelden degisir
     LOOP_TICK = 30  # ana dongu her 30 saniyede bir "sirasi geldi mi" diye bakar
 
     # --- FIYAT DUSUS ESIGI (genel varsayilan - urun bazinda ezilebilir) ---
     PRICE_DROP_PERCENT = float(os.environ.get("PRICE_DROP_PERCENT", "5"))
+
+    # --- YAVAS DUSUS (varsayilan KAPALI; panelden urun bazinda acilir) ---
+    # Fiyat her kontrolde esigin altinda kalarak adim adim inerse normal alarm hic calismaz. slow_pct > 0 ise fiyat
+    # son ~3 saatlik ortalamanin o kadar % altina inince bir kez bildirilir (urun basina en sik SLOW_DROP_COOLDOWN sn'de bir).
+    SLOW_DROP_PERCENT = float(os.environ.get("SLOW_DROP_PERCENT", "0"))
+    SLOW_DROP_COOLDOWN = int(os.environ.get("SLOW_DROP_COOLDOWN_SEC", "10800"))
+    SLOW_REF_TAU = 3 * 3600
+    ITEM_TICK = 5   # urun zamanlayicisi (AYRI is parcacigi) 5 sn'de bir "sirasi gelen urun var mi" diye bakar
 
     # --- MUTLAK "IYI FIYAT" ESIGI (sadece enerji degeri tanimli urunler icin,
     # su an sadece ekmek). CC/enerji orani bu deger VE ALTINA duserse - onceki
@@ -362,6 +370,20 @@ def bot_loop():
             # Eski format (Etiket=URL) ile geriye donuk uyumluluk
             label, url = parts[0].split("=", 1)
             _add_item(label, url, 0, PRICE_DROP_PERCENT, 0)
+
+    # --- Calisma zamaninda degistirilebilir urun ayarlari (Tampermonkey "Takip" paneli) ---
+    # Varsayilanlar yukaridaki env/kod listesinden gelir; panelde degistirilip kaydedilen degerler bunlarin USTUNE biner.
+    with _item_cfg_lock:
+        _item_default.clear()
+        _item_cfg.clear()
+        for _lb, _u in ITEM_URLS.items():
+            _item_default[_lb] = {
+                "url": _u, "enabled": True, "interval": ITEM_CHECK_INTERVAL,
+                "drop_pct": ITEM_DROP_PCT.get(_lb, PRICE_DROP_PERCENT), "min_qty": ITEM_MIN_QTY.get(_lb, 0),
+                "max_price": ITEM_MAX_PRICE.get(_lb, 0) or 0, "slow_pct": SLOW_DROP_PERCENT, "energy": ITEM_ENERGY.get(_lb, 0),
+            }
+            _item_cfg[_lb] = dict(_item_default[_lb])
+    _watch_cfg_load()
 
     HDR = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -462,91 +484,164 @@ def bot_loop():
     last_lowest_price = {}  # label -> fiyat
     abs_alerted = {}        # label -> en son mutlak-fiyat alarminda bildirilen fiyat
     good_value_state = {}   # label -> su an "iyi fiyat" esigi altinda mi (spam onlemek icin)
+    ref_price = {}          # label -> ~3 saatlik ustel ortalama fiyat (yavas dusus referansi)
+    ref_ts = {}             # label -> referansin son guncellendigi zaman
+    slow_alert_ts = {}      # label -> son yavas-dusus alarminin zamani
+    item_last_check = {}    # label -> son kontrol zamani (urun bazinda aralik icin)
+    item_sig = {}           # label -> (min_qty,): filtre degisirse eski taban fiyat gecersiz sayilir
+
+    import math
+
+    def _note_alert(label, kind, price):
+        _item_status.setdefault(label, {})["last_alert"] = {"kind": kind, "at": time.time(), "price": price}
+
+    def _check_one(label, cfg):
+        url = cfg["url"]
+        st = _item_status.setdefault(label, {"checks": 0})
+        try:
+            min_qty = cfg["min_qty"]
+            drop_pct_threshold = cfg["drop_pct"]
+            sig = (min_qty,)
+            if item_sig.get(label) not in (None, sig):       # min adet filtresi degisti: eski taban fiyat yaniltir -> sifirla
+                last_lowest_price.pop(label, None)
+                ref_price.pop(label, None)
+                ref_ts.pop(label, None)
+            item_sig[label] = sig
+            rows = fetch_table_rows(url)
+            if DEBUG:
+                print(f"[TANI] {label} - satir sayisi: {len(rows)}, min miktar: {min_qty}")
+
+            best = None  # (price, link, amount)
+            for tds in rows:
+                if len(tds) < 5:
+                    continue
+                amount = parse_number(tds[2].get_text(strip=True))
+                price = parse_number(tds[3].get_text(strip=True))
+                link_tag = tds[4].find("a")
+                link = link_tag["href"] if link_tag and link_tag.has_attr("href") else ""
+
+                if price is None:
+                    continue
+                if min_qty > 0 and (amount is None or amount < min_qty):
+                    continue  # cok az miktarli ilanlari yok say
+                if best is None or price < best[0]:
+                    best = (price, link, amount)
+
+            if not best:
+                print(f"[TANI] {label} tablosu parse edilemedi "
+                      f"(en az {min_qty} adetlik ilan bulunamadi).")
+                st.update(checked_at=time.time(), ok=False, error=f"en az {min_qty:g} adetlik ilan bulunamadi")
+                return
+
+            price, link, amount = best
+            st.update(price=price, amount=amount, link=link, checked_at=time.time(), ok=True, error="", checks=st.get("checks", 0) + 1)
+            if DEBUG:
+                print(f"[TANI] {label} en dusuk fiyat: {price} ({amount} adet)")
+
+            sudden_alerted = False
+            if label in last_lowest_price:
+                baseline = last_lowest_price[label]
+                threshold_price = baseline * (1 - drop_pct_threshold / 100)
+                if baseline > 0 and price <= threshold_price:
+                    drop_pct = (1 - price / baseline) * 100
+                    msg = (f"FIYAT DUSTU: {label}\n"
+                           f"Onceki en dusuk: {baseline:.2f}\n"
+                           f"Yeni en dusuk: {price:.2f} (%{drop_pct:.1f} dusus, esik: %{drop_pct_threshold:.0f})\n"
+                           f"Link: {link}")
+                    send_tg(msg)
+                    print(f"FIYAT ALARMI GONDERILDI: {label} -> {price}")
+                    _note_alert(label, "dusus", price)
+                    sudden_alerted = True
+
+            # --- YAVAS DUSUS (urun bazinda slow_pct > 0 ise): son ~3 saatlik ortalamanin belirgin altina inildi mi? ---
+            slow_pct = cfg.get("slow_pct", 0) or 0
+            nowt = time.time()
+            ref = ref_price.get(label)
+            if (slow_pct > 0 and ref and not sudden_alerted
+                    and price <= ref * (1 - slow_pct / 100)
+                    and nowt - slow_alert_ts.get(label, 0) > SLOW_DROP_COOLDOWN):
+                send_tg(f"YAVAS DUSUS: {label}\n"
+                        f"Son ~3 saat ortalamasi: {ref:.2f}\n"
+                        f"Simdi en dusuk: {price:.2f} (%{(1 - price / ref) * 100:.1f} altinda, esik: %{slow_pct:.0f})\n"
+                        f"Link: {link}")
+                print(f"YAVAS DUSUS ALARMI GONDERILDI: {label} -> {price}")
+                _note_alert(label, "yavas", price)
+                slow_alert_ts[label] = nowt
+            if label in ref_price:                       # zaman-bazli ustel ortalama (kontrol sikligindan bagimsiz)
+                a = 1 - math.exp(-max(0.0, nowt - ref_ts.get(label, nowt)) / SLOW_REF_TAU)
+                ref_price[label] += (price - ref_price[label]) * a
+            else:
+                ref_price[label] = price
+            ref_ts[label] = nowt
+
+            # --- MUTLAK KAR FIYATI ALARMI ---
+            max_price = cfg.get("max_price") or None
+            if max_price:
+                if price <= max_price:
+                    prev_alert = abs_alerted.get(label)
+                    if prev_alert is None or price <= prev_alert * 0.95:     # ilk kez veya bildirilenden en az %5 daha ucuz
+                        send_tg(f"KARLI FIYAT: {label}\n"
+                                f"En dusuk: {price:.2f} (kar esigi: {max_price:.0f})\n"
+                                f"Link: {link}")
+                        print(f"KAR ALARMI GONDERILDI: {label} -> {price}")
+                        _note_alert(label, "karli", price)
+                        abs_alerted[label] = price
+                else:
+                    abs_alerted.pop(label, None)                              # esigin ustune cikti: bir sonraki inise hazir
+
+            last_lowest_price[label] = price
+
+            # --- MUTLAK "IYI FIYAT" KONTROLU (sadece enerji degeri tanimli urunlerde) ---
+            energy = cfg.get("energy", 0) or 0
+            if energy > 0:
+                value_ratio = price / energy
+                was_good = good_value_state.get(label, False)
+                is_good = value_ratio <= ABS_VALUE_THRESHOLD
+
+                if is_good and not was_good:
+                    msg = (f"IYI FIYAT: {label}\n"
+                           f"Fiyat: {price:.2f} | Enerji: {energy:.0f} | "
+                           f"Oran: {value_ratio:.3f} CC/enerji (esik: {ABS_VALUE_THRESHOLD:.2f})\n"
+                           f"Link: {link}")
+                    send_tg(msg)
+                    print(f"IYI FIYAT ALARMI GONDERILDI: {label} -> {value_ratio:.3f}")
+                    _note_alert(label, "iyi", price)
+
+                good_value_state[label] = is_good
+        except Exception as e:
+            print(f"{label} kontrol hatasi: {e}")
+            st.update(checked_at=time.time(), ok=False, error=str(e)[:120])
 
     def check_items():
-        for label, url in ITEM_URLS.items():
-            try:
-                min_qty = ITEM_MIN_QTY.get(label, 0)
-                drop_pct_threshold = ITEM_DROP_PCT.get(label, PRICE_DROP_PERCENT)
-                rows = fetch_table_rows(url)
-                if DEBUG:
-                    print(f"[TANI] {label} - satir sayisi: {len(rows)}, min miktar: {min_qty}")
-
-                best = None  # (price, link, amount)
-                for tds in rows:
-                    if len(tds) < 5:
-                        continue
-                    amount = parse_number(tds[2].get_text(strip=True))
-                    price = parse_number(tds[3].get_text(strip=True))
-                    link_tag = tds[4].find("a")
-                    link = link_tag["href"] if link_tag and link_tag.has_attr("href") else ""
-
-                    if price is None:
-                        continue
-                    if min_qty > 0 and (amount is None or amount < min_qty):
-                        continue  # cok az miktarli ilanlari yok say
-                    if best is None or price < best[0]:
-                        best = (price, link, amount)
-
-                if not best:
-                    print(f"[TANI] {label} tablosu parse edilemedi "
-                          f"(en az {min_qty} adetlik ilan bulunamadi).")
-                    continue
-
-                price, link, amount = best
-                if DEBUG:
-                    print(f"[TANI] {label} en dusuk fiyat: {price} ({amount} adet)")
-
-                if label in last_lowest_price:
-                    baseline = last_lowest_price[label]
-                    threshold_price = baseline * (1 - drop_pct_threshold / 100)
-                    if baseline > 0 and price <= threshold_price:
-                        drop_pct = (1 - price / baseline) * 100
-                        msg = (f"FIYAT DUSTU: {label}\n"
-                               f"Onceki en dusuk: {baseline:.2f}\n"
-                               f"Yeni en dusuk: {price:.2f} (%{drop_pct:.1f} dusus, esik: %{drop_pct_threshold:.0f})\n"
-                               f"Link: {link}")
-                        send_tg(msg)
-                        print(f"FIYAT ALARMI GONDERILDI: {label} -> {price}")
-
-                # --- MUTLAK KAR FIYATI ALARMI ---
-                max_price = ITEM_MAX_PRICE.get(label)
-                if max_price:
-                    if price <= max_price:
-                        prev_alert = abs_alerted.get(label)
-                        if prev_alert is None or price <= prev_alert * 0.95:     # ilk kez veya bildirilenden en az %5 daha ucuz
-                            send_tg(f"KARLI FIYAT: {label}\n"
-                                    f"En dusuk: {price:.2f} (kar esigi: {max_price:.0f})\n"
-                                    f"Link: {link}")
-                            print(f"KAR ALARMI GONDERILDI: {label} -> {price}")
-                            abs_alerted[label] = price
-                    else:
-                        abs_alerted.pop(label, None)                              # esigin ustune cikti: bir sonraki inise hazir
-
-                last_lowest_price[label] = price
-
-                # --- MUTLAK "IYI FIYAT" KONTROLU (sadece enerji degeri tanimli urunlerde) ---
-                energy = ITEM_ENERGY.get(label, 0)
-                if energy > 0:
-                    value_ratio = price / energy
-                    was_good = good_value_state.get(label, False)
-                    is_good = value_ratio <= ABS_VALUE_THRESHOLD
-
-                    if is_good and not was_good:
-                        msg = (f"IYI FIYAT: {label}\n"
-                               f"Fiyat: {price:.2f} | Enerji: {energy:.0f} | "
-                               f"Oran: {value_ratio:.3f} CC/enerji (esik: {ABS_VALUE_THRESHOLD:.2f})\n"
-                               f"Link: {link}")
-                        send_tg(msg)
-                        print(f"IYI FIYAT ALARMI GONDERILDI: {label} -> {value_ratio:.3f}")
-
-                    good_value_state[label] = is_good
-            except Exception as e:
-                print(f"{label} kontrol hatasi: {e}")
+        """Sirasi gelen urunleri (urun bazinda aralik) kontrol eder. Ayri is parcaciginda calisir: erepublik.tools yavaslasa
+        bile ana dongu (enerji, altin hatirlaticisi, is ilanlari) etkilenmez."""
+        import math  # noqa: F401  (yavas dusus ustel ortalamasi icin)
+        _item_hb[0] = time.time()
+        for label in list(ITEM_URLS):
+            with _item_cfg_lock:
+                cfg = dict(_item_cfg.get(label) or {})
+            if not cfg or not cfg.get("enabled", True):
+                continue
+            if time.time() - item_last_check.get(label, 0) < cfg["interval"]:
+                continue
+            item_last_check[label] = time.time()
+            _check_one(label, cfg)
 
     # ---------------- ANA DONGU ----------------
     send_tg("Market Watcher Botu Baslatildi!")
     print("Bot baslatildi ve Telegram'a bilgi mesaji gonderildi.")
+
+    def _item_worker():
+        while True:
+            try:
+                check_items()
+            except Exception as e:
+                print(f"[TAKIP] zamanlayici hatasi: {e}")
+            time.sleep(ITEM_TICK)
+
+    _item_step_ref[0] = check_items      # (test icin) tek bir zamanlama turunu dis dunyadan calistirabilmek
+    threading.Thread(target=_item_worker, daemon=True).start()
+    print(f"[TAKIP] {len(ITEM_URLS)} urun, varsayilan aralik {ITEM_CHECK_INTERVAL} sn; ayarlar /watch-config ile degistirilebilir.")
 
     last_job_check = 0
     last_item_check = 0
@@ -568,9 +663,7 @@ def bot_loop():
                 check_jobs()
                 last_job_check = now
 
-            if now - last_item_check >= ITEM_CHECK_INTERVAL:
-                check_items()
-                last_item_check = now
+            # (urun kontrolu artik AYRI is parcaciginda: asagidaki _item_worker)
 
             # --- Enerji tahmini: dolma zamani geldiyse (tarayici acik olmasa bile) ---
             with _energy_lock:
@@ -627,7 +720,7 @@ import hashlib
 GIST_ID = os.environ.get("GIST_ID", "").strip()
 GIST_TOKEN = os.environ.get("GIST_TOKEN", "").strip()
 CLOUD_BACKUP_SEC = max(120, int(os.environ.get("CLOUD_BACKUP_SEC", "600")))
-CLOUD_NAMES = {"ACT": "market_activity.json.gz.b64", "LEDGER": "erp_ledger.json.gz.b64"}
+CLOUD_NAMES = {"ACT": "market_activity.json.gz.b64", "LEDGER": "erp_ledger.json.gz.b64", "WATCH": "watch_cfg.json.gz.b64"}
 _cloud_last = [0.0]
 _cloud_hash = {}
 _cloud_busy = threading.Lock()
@@ -663,7 +756,7 @@ def _cloud_restore(path, name):
 def _cloud_upload():
     try:
         files = {}
-        for key, path in (("ACT", ACT_FILE), ("LEDGER", LEDGER_FILE)):
+        for key, path in (("ACT", ACT_FILE), ("LEDGER", LEDGER_FILE), ("WATCH", WATCH_CFG_FILE)):
             if not os.path.exists(path):
                 continue
             with open(path, "rb") as fh:
@@ -677,7 +770,7 @@ def _cloud_upload():
             return
         r = requests.patch(f"https://api.github.com/gists/{GIST_ID}", headers=_cloud_headers(), json={"files": files}, timeout=90)
         if r.status_code != 200:
-            for key in ("ACT", "LEDGER"):
+            for key in ("ACT", "LEDGER", "WATCH"):
                 _cloud_hash.pop(key, None)                  # basarisiz: bir sonraki turda yeniden dene
             print(f"[YEDEK] yukleme basarisiz: {r.status_code} {r.text[:120]}")
         else:
@@ -1209,6 +1302,149 @@ def ledger_buy():
             del _ledger["buys"][:-LEDGER_MAX_BUYS]
             _ledger_save()
     return jsonify({"ok": True})
+
+
+# ============ URUN TAKIP AYARLARI (Tampermonkey "Takip" paneli ile calisma zamaninda degistirilebilir) ============
+# bot_loop() her urun icin varsayilanlari (ITEM_WATCH_URLS / env) buraya yazar. Panel /watch-config ile urun bazinda
+# aralik, dusus %, min adet, mutlak fiyat, yavas dusus % ve acik/kapali degistirir; degisiklik bir sonraki kontrolde gecerli olur.
+# Yalnizca VARSAYILANDAN FARKLI degerler dosyaya yazilir (+ Gist yedegi); yeni urun eklenirse varsayilanla gelir.
+WATCH_CFG_FILE = os.environ.get("WATCH_CFG_FILE", "/tmp/watch_cfg.json")
+WATCH_FIELDS = {                 # alan -> (alt, ust)   (0 = kapali olan alanlarda 0 gecerli)
+    "interval": (60, 3600), "drop_pct": (0.1, 90.0), "min_qty": (0, 10_000_000),
+    "max_price": (0, 1e9), "slow_pct": (0, 90.0), "energy": (0, 1e6),
+}
+_item_cfg = {}                   # label -> gecerli ayarlar
+_item_default = {}               # label -> varsayilan ayarlar
+_item_status = {}                # label -> son durum (fiyat, kontrol zamani, son alarm ...)
+_item_cfg_lock = threading.Lock()
+_item_hb = [0.0]                 # urun zamanlayicisinin son calisma zamani (panelde "calisiyor mu")
+_item_step_ref = [None]          # (test icin) tek bir zamanlama turunu calistiran fonksiyon
+
+
+def _watch_clean(patch):
+    """Tek bir urunun degisiklik sozlugunu dogrular. -> (temiz_sozluk, hata_listesi)"""
+    clean, errs = {}, []
+    if not isinstance(patch, dict):
+        return clean, ["gecersiz govde"]
+    for k, v in patch.items():
+        if k == "enabled":
+            if isinstance(v, bool):
+                clean[k] = v
+            elif v in (0, 1, "0", "1", "true", "false"):
+                clean[k] = v in (1, "1", "true")
+            else:
+                errs.append("enabled: acik/kapali olmali")
+        elif k in WATCH_FIELDS:
+            if isinstance(v, bool):
+                errs.append(f"{k}: sayi olmali")
+                continue
+            try:
+                x = float(v)
+            except (TypeError, ValueError):
+                errs.append(f"{k}: sayi olmali")
+                continue
+            lo, hi = WATCH_FIELDS[k]
+            if not (x == x) or x < lo or x > hi:
+                errs.append(f"{k}: {lo:g} ile {hi:g} arasinda olmali")
+                continue
+            if k == "slow_pct" and 0 < x < 0.5:
+                errs.append("slow_pct: 0 (kapali) ya da en az 0.5 olmali")
+                continue
+            clean[k] = int(round(x)) if k == "interval" else x
+        elif k != "url":
+            errs.append(f"{k}: bilinmeyen alan")
+    return clean, errs
+
+
+def _watch_overrides():
+    out = {}
+    for lb, cfg in _item_cfg.items():
+        d = _item_default.get(lb, {})
+        diff = {k: v for k, v in cfg.items() if k != "url" and v != d.get(k)}
+        if diff:
+            out[lb] = diff
+    return out
+
+
+def _watch_cfg_save():
+    try:
+        with _item_cfg_lock:
+            data = {"v": 1, "ts": time.time(), "overrides": _watch_overrides()}
+        tmp = WATCH_CFG_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            _json.dump(data, f)
+        os.replace(tmp, WATCH_CFG_FILE)
+        _cloud_backup_async(force=True)          # ayar degisikligi nadirdir: bekletmeden Gist'e yedekle
+    except Exception as e:
+        print(f"[TAKIP] ayar kayit hatasi: {e}")
+
+
+def _watch_cfg_load():
+    try:
+        _cloud_restore(WATCH_CFG_FILE, CLOUD_NAMES["WATCH"])
+        with open(WATCH_CFG_FILE) as f:
+            data = _json.load(f)
+    except FileNotFoundError:
+        return
+    except Exception as e:
+        print(f"[TAKIP] ayar yukleme hatasi: {e}")
+        return
+    n = 0
+    with _item_cfg_lock:
+        for lb, patch in (data.get("overrides") or {}).items():
+            if lb in _item_cfg:
+                clean, _ = _watch_clean(patch)
+                if clean:
+                    _item_cfg[lb].update(clean)
+                    n += 1
+    print(f"[TAKIP] {n} urun icin kayitli ayar yuklendi.")
+
+
+def _watch_state():
+    with _item_cfg_lock:
+        items = []
+        for lb, cfg in _item_cfg.items():
+            d = _item_default.get(lb, {})
+            items.append(dict(cfg, label=lb, default={k: d.get(k) for k in list(WATCH_FIELDS) + ["enabled"]},
+                              modified=any(cfg.get(k) != d.get(k) for k in cfg if k != "url"),
+                              status=dict(_item_status.get(lb) or {})))
+        return {"ok": True, "now": time.time(), "heartbeat": _item_hb[0], "items": items,
+                "limits": {k: list(v) for k, v in WATCH_FIELDS.items()}, "site_refresh_sec": 120}
+
+
+@app.route('/watch-config', methods=['GET', 'POST'])
+def watch_config():
+    if not _check_api_secret():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    if request.method == 'POST':
+        body = request.get_json(force=True, silent=True) or {}
+        errors, plan = {}, {}
+        with _item_cfg_lock:
+            labels = list(_item_cfg)
+            if isinstance(body.get("all"), dict):                      # tum liste icin toplu uygulama
+                clean, errs = _watch_clean(body["all"])
+                if errs:
+                    errors["all"] = errs
+                for lb in labels:
+                    plan.setdefault(lb, {}).update(clean)
+            for lb, patch in (body.get("items") or {}).items():
+                if lb not in _item_cfg:
+                    errors[lb] = ["bilinmeyen urun"]
+                    continue
+                clean, errs = _watch_clean(patch)
+                if errs:
+                    errors[lb] = errs
+                plan.setdefault(lb, {}).update(clean)
+            reset = labels if body.get("reset_all") else [lb for lb in (body.get("reset") or []) if lb in _item_cfg]
+            if errors:                                                  # ATOMIK: hata varsa hicbir sey degismez
+                return jsonify({"ok": False, "errors": errors}), 400
+            for lb in reset:
+                _item_cfg[lb] = dict(_item_default[lb])
+            for lb, patch in plan.items():
+                if lb not in reset or patch:
+                    _item_cfg[lb].update(patch)
+        _watch_cfg_save()
+    return jsonify(_watch_state())
 
 
 # Thread'i modul seviyesinde baslatiyoruz - Render'da "gunicorn app:app" gibi
