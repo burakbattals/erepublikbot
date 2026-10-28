@@ -130,9 +130,9 @@ def set_rw_state():
             _rw_state["cycles"] = body["cycles"]
         if "occ" in body:
             _rw_state["occ"] = body["occ"]
-        _rw_persist()
         if "bootstrapped" in body:
             _rw_state["bootstrapped"] = body["bootstrapped"]
+    _rw_persist()   # kilit DISINDA: icinde kendi kilidini aliyor
     return jsonify({"ok": True})
 
 
