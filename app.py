@@ -105,7 +105,7 @@ def send_tg(text):
 # de telefondan da acilsa, hangi cihaz olursa olsun AYNI veriyi okur/yazar.
 # Kilit de burada, gercek bir threading.Lock ile ATOMIK - tarayici tarafinda
 # yasadigimiz "iki taraf da ayni anda kilidi aldi" yarisi burada olusmaz.
-_rw_state = {"alerted": {}, "history": {}, "cycles": {}, "bootstrapped": False}
+_rw_state = {"alerted": {}, "history": {}, "cycles": {}, "occ": {}, "bootstrapped": False}
 _rw_state_lock = threading.Lock()
 _rw_scan_lock = {"owner": None, "ts": 0}
 _rw_scan_lock_guard = threading.Lock()
@@ -128,6 +128,9 @@ def set_rw_state():
             _rw_state["history"] = body["history"]
         if "cycles" in body:
             _rw_state["cycles"] = body["cycles"]
+        if "occ" in body:
+            _rw_state["occ"] = body["occ"]
+        _rw_persist()
         if "bootstrapped" in body:
             _rw_state["bootstrapped"] = body["bootstrapped"]
     return jsonify({"ok": True})
@@ -720,7 +723,8 @@ import hashlib
 GIST_ID = os.environ.get("GIST_ID", "").strip()
 GIST_TOKEN = os.environ.get("GIST_TOKEN", "").strip()
 CLOUD_BACKUP_SEC = max(120, int(os.environ.get("CLOUD_BACKUP_SEC", "600")))
-CLOUD_NAMES = {"ACT": "market_activity.json.gz.b64", "LEDGER": "erp_ledger.json.gz.b64", "WATCH": "watch_cfg.json.gz.b64"}
+CLOUD_NAMES = {"ACT": "market_activity.json.gz.b64", "LEDGER": "erp_ledger.json.gz.b64", "WATCH": "watch_cfg.json.gz.b64", "RW": "rw_state.json.gz.b64"}
+RW_FILE = os.environ.get("RW_FILE", "/tmp/rw_state.json")
 _cloud_last = [0.0]
 _cloud_hash = {}
 _cloud_busy = threading.Lock()
@@ -756,7 +760,7 @@ def _cloud_restore(path, name):
 def _cloud_upload():
     try:
         files = {}
-        for key, path in (("ACT", ACT_FILE), ("LEDGER", LEDGER_FILE), ("WATCH", WATCH_CFG_FILE)):
+        for key, path in (("ACT", ACT_FILE), ("LEDGER", LEDGER_FILE), ("WATCH", WATCH_CFG_FILE), ("RW", RW_FILE)):
             if not os.path.exists(path):
                 continue
             with open(path, "rb") as fh:
@@ -770,7 +774,7 @@ def _cloud_upload():
             return
         r = requests.patch(f"https://api.github.com/gists/{GIST_ID}", headers=_cloud_headers(), json={"files": files}, timeout=90)
         if r.status_code != 200:
-            for key in ("ACT", "LEDGER", "WATCH"):
+            for key in ("ACT", "LEDGER", "WATCH", "RW"):
                 _cloud_hash.pop(key, None)                  # basarisiz: bir sonraki turda yeniden dene
             print(f"[YEDEK] yukleme basarisiz: {r.status_code} {r.text[:120]}")
         else:
@@ -794,6 +798,40 @@ def _cloud_backup_async(force=False):
     _cloud_last[0] = now
     threading.Thread(target=_cloud_upload, daemon=True).start()
 
+
+def _rw_persist():
+    """RW durumunu dosyaya yazar ve Gist'e yedekler (Render yeniden baslayinca kaybolmasin)."""
+    try:
+        with _rw_state_lock:
+            data = _json.dumps(_rw_state, ensure_ascii=False)
+        tmp = RW_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(data)
+        os.replace(tmp, RW_FILE)
+        _cloud_backup_async(force=True)
+    except Exception as e:
+        print(f"[RW] durum kaydedilemedi: {e}")
+
+
+def _rw_load():
+    """Acilista once Gist'ten (yerel dosya yoksa) geri yukler, sonra RW durumunu okur."""
+    try:
+        _cloud_restore(RW_FILE, CLOUD_NAMES["RW"])
+        if not os.path.exists(RW_FILE):
+            return
+        with open(RW_FILE, encoding="utf-8") as fh:
+            d = _json.load(fh)
+        with _rw_state_lock:
+            for k in ("alerted", "history", "cycles", "occ"):
+                if isinstance(d.get(k), dict):
+                    _rw_state[k] = d[k]
+            _rw_state["bootstrapped"] = bool(d.get("bootstrapped"))
+        print(f"[RW] durum yuklendi: {len(_rw_state['cycles'])} bolge zinciri.")
+    except Exception as e:
+        print(f"[RW] durum yuklenemedi: {e}")
+
+
+_rw_load()
 
 ACT_ENABLED = os.environ.get("ACTIVITY_ENABLED", "1") == "1"
 ACT_API = "https://service.erepublik.tools/api/v1/market/item/{c}/{i}/{q}"
