@@ -136,6 +136,21 @@ def set_rw_state():
     return jsonify({"ok": True})
 
 
+@app.route('/rw-restore', methods=['GET'])
+def rw_restore_page():
+    # Yedek JSON'u (eski /rw-state ciktisi) yapistirip sunucuya geri yuklemek icin basit sayfa.
+    from flask import Response
+    html = ("<meta charset='utf-8'><title>RW geri yukle</title>"
+            "<body style='font-family:sans-serif;max-width:700px;margin:20px auto'>"
+            "<h3>RW durumunu geri yukle</h3>"
+            "<p>Eski /rw-state ciktisini asagiya yapistir.</p>"
+            "<textarea id='t' style='width:100%;height:300px'></textarea><br>"
+            "<button onclick=\"fetch('/rw-state',{method:'POST',headers:{'Content-Type':'application/json'},body:document.getElementById('t').value})"
+            ".then(r=>r.json()).then(j=>document.getElementById('o').textContent=JSON.stringify(j)).catch(e=>document.getElementById('o').textContent='Hata: '+e)\">Geri yukle</button>"
+            " <span id='o'></span></body>")
+    return Response(html, mimetype='text/html')
+
+
 @app.route('/rw-lock/acquire', methods=['POST'])
 def acquire_rw_lock():
     body = request.get_json(force=True, silent=True) or {}
